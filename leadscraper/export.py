@@ -13,7 +13,7 @@ COLUMNS = [("Name", 38), ("Phone", 22), ("Email", 38), ("Address", 60), ("Websit
 
 
 def _row(l: Lead) -> list:
-    return [l.name, l.phone_display, l.email, l.address, l.website_status or ('Yes' if l.website else 'No'), l.website]
+    return [l.name, l.phone_display, l.email or l.email_note, l.address, l.website_status or ('Yes' if l.website else 'No'), l.website]
 
 
 def safe_filename(*parts: str) -> str:
@@ -35,9 +35,11 @@ def write_xlsx(leads: list[Lead], path: str, meta: dict[str, str]) -> None:
         ws.append([_clip(v) for v in _row(l)])
     for r in range(2, ws.max_row + 1):
         c = ws.cell(r, 3)
-        if c.value:
+        if c.value and "@" in str(c.value):
             c.hyperlink = "mailto:" + str(c.value)
             c.font = Font(color="0563C1", underline="single")
+        elif c.value:   # a reason such as "Not found on website"
+            c.font = Font(color="808080", italic=True)
         w = ws.cell(r, 6)
         if w.value and str(w.value).startswith("http"):
             w.hyperlink = str(w.value)
@@ -54,6 +56,8 @@ def write_xlsx(leads: list[Lead], path: str, meta: dict[str, str]) -> None:
         ("With phone", sum(bool(l.phone) for l in leads)),
         ("With a website", sum(bool(l.website) for l in leads)),
         ("No website", sum(not l.website for l in leads)),
+        ("Email not found on website", sum(l.email_note == "Not found on website" for l in leads)),
+        ("No website (so no email)", sum(l.email_note.startswith("No website") for l in leads)),
         ("With email AND phone", sum(bool(l.email and l.phone) for l in leads)),
         ("Note", "Emails are only listed when found on the business's own listing/website and the "
                  "domain accepts mail. Phones are only listed when they are valid for their country."),

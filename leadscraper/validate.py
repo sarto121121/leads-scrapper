@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import re
 import threading
+from urllib.parse import unquote
 
 import dns.exception
 import dns.resolver
@@ -25,8 +26,8 @@ _mx_lock = threading.Lock()
 
 def clean_email(raw: str) -> str | None:
     """Return a normalised email or None if it is syntactically junk."""
-    e = raw.strip().strip(".,;:<>()[]\"'").lower()
-    e = e.removeprefix("mailto:").split("?")[0]
+    e = unquote(raw).strip().strip(".,;:<>()[]\"'").lower()   # mailto links are URL-encoded ("%20info@..")
+    e = e.removeprefix("mailto:").split("?")[0].strip()
     m = EMAIL_RE.match(e)
     if not m:
         return None
@@ -68,7 +69,7 @@ def _host(url: str) -> str:
     return h[4:] if h.startswith("www.") else h
 
 
-def _same_site(domain: str, website: str) -> bool:
+def same_site(domain: str, website: str) -> bool:
     h = _host(website)
     return bool(h) and (domain == h or domain.endswith("." + h) or h.endswith("." + domain))
 
@@ -77,7 +78,7 @@ def rank_emails(emails: list[str], website: str = "") -> list[str]:
     """Best first: same domain as the business website, then named mailboxes over role ones."""
     def score(e: str) -> tuple[int, int]:
         local, domain = e.split("@")
-        return (0 if website and _same_site(domain, website) else 1,
+        return (0 if website and same_site(domain, website) else 1,
                 1 if local in ROLE_LOCAL else 0)
     return sorted(dict.fromkeys(emails), key=score)
 
@@ -98,7 +99,7 @@ def verify_emails(raw: list[str], website: str = "", check_dns: bool = True) -> 
     ranked = rank_emails([e for e, _ in good], website)
     best = ranked[0]
     label = {"ok": "Valid (domain accepts mail)", "unknown": "Unverified (DNS check unavailable)"}[status_of[best]]
-    if website and _same_site(best.split("@")[1], website):
+    if website and same_site(best.split("@")[1], website):
         label += ", matches website"
     return best, ranked[1:], label
 

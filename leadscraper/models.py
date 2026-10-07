@@ -16,6 +16,8 @@ class Lead:
     email: str = ""              # best email
     other_emails: list[str] = field(default_factory=list)
     email_status: str = ""
+    email_note: str = ""         # why there is no email (shown in the Email column)
+    site_state: str = ""         # ok / down / blocked / "" (website not visited)
     website: str = ""
     website_status: str = ""     # Yes / No
     socials: dict[str, str] = field(default_factory=dict)

@@ -360,3 +360,58 @@ def test_history_file_survives_corruption(tmp_path):
     p.write_text("{not json")
     h = History(p)
     assert h.exported == 0 and (tmp_path / "h.broken").exists()
+
+
+# ---------- email reasons + recall fixes ----------
+
+def test_mailto_url_encoding_fixed():
+    assert clean_email("%20info@smileon.pk") == "info@smileon.pk"
+    assert extract_emails('<a href="mailto:%20info@smileon.pk">x</a>') == ["info@smileon.pk"]
+    assert set(extract_emails('<a href="mailto:a@x.pk,b@x.pk?subject=Hi">x</a>')) == {"a@x.pk", "b@x.pk"}
+
+
+def test_embedded_json_ld_email_only_if_same_domain():
+    from leadscraper.enrich import extract_embedded_emails, crawl
+    html = ('<script type="application/ld+json">{"@type":"Dentist","email":"care@smile.pk"}</script>'
+            '<script>var s="support@elementor.com"; var u="owner\\u0040smile.pk";</script>')
+    assert set(extract_embedded_emails(html)) == {"care@smile.pk", "support@elementor.com", "owner@smile.pk"}
+
+    class Raw:
+        def read(self, n, decode_content=True): return html.encode()
+
+    class Resp:
+        ok, url, encoding, headers, raw = True, "http://smile.pk", "utf-8", {"content-type": "text/html"}, Raw()
+        def close(self): pass
+
+    class S:
+        def get(self, url, **kw): return Resp()
+
+    # visible text has no email; the third-party address in the script must NOT be trusted
+    assert set(crawl("smile.pk", "PK", S(), None).emails) == {"care@smile.pk", "owner@smile.pk"}
+
+
+def test_email_reasons(tmp_path):
+    cases = {
+        "none": Lead("A"),
+        "ok": Lead("B", website="http://b.pk", site_state="ok"),
+        "down": Lead("C", website="http://c.pk", site_state="down"),
+        "blocked": Lead("D", website="http://d.pk", site_state="blocked"),
+        "unchecked": Lead("E", website="http://e.pk"),
+        "bad": Lead("F", website="http://f.pk", site_state="ok", raw_emails=["x@no-such-domain.invalid"]),
+        "good": Lead("G", website="http://g.pk", site_state="ok", raw_emails=["hi@g.pk"]),
+    }
+    leads = list(cases.values())
+    finalize(leads, "PK", check_dns=False)
+    notes = {k: v.email_note for k, v in cases.items()}
+    assert notes["none"] == "No website - email not available"
+    assert notes["ok"] == "Not found on website"
+    assert notes["down"] == "Website not responding"
+    assert notes["blocked"] == "Website blocks automated access"
+    assert notes["unchecked"] == "Not checked"
+    assert cases["good"].email == "hi@g.pk" and cases["good"].email_note == ""
+    p = tmp_path / "n.xlsx"
+    write_xlsx(leads, str(p), {})
+    ws = openpyxl.load_workbook(p)["Leads"]
+    col = {ws.cell(r, 1).value: ws.cell(r, 3).value for r in range(2, ws.max_row + 1)}
+    assert col["A"] == "No website - email not available" and col["G"] == "hi@g.pk"
+    assert ws.cell(2, 3).hyperlink is None and ws.cell(8, 3).hyperlink is not None

@@ -68,6 +68,7 @@ def enrich_all(leads: list[Lead], region: str | None, workers: int = 24, timeout
 
     def work(l: Lead) -> None:
         info = crawl(l.website, region, session, robots, timeout)
+        l.site_state = "blocked" if info.robots_blocked else "ok" if info.reachable else "down"
         l.raw_emails += [e for e in info.emails if e not in l.raw_emails]
         # phones from the website are only a fallback, listed after directory data
         l.raw_phones += [p for p in info.phones[:3] if p not in l.raw_phones]
@@ -95,5 +96,16 @@ def finalize(leads: list[Lead], region: str | None, check_dns: bool = True) -> N
         l.website_status = "Yes" if l.website else "No"
         l.phone, l.phone_display, l.phone_type = best_phone(l.raw_phones, region)
         l.email, l.other_emails, l.email_status = verify_emails(l.raw_emails, l.website, check_dns)
+        l.email_note = "" if l.email else _why_no_email(l)
     with ThreadPoolExecutor(max_workers=16) as ex:
         list(ex.map(one, leads))
+
+
+def _why_no_email(l: Lead) -> str:
+    """Say why a lead has no email instead of leaving the cell blank."""
+    if l.raw_emails:
+        return "Email found but its domain is invalid"
+    if not l.website:
+        return "No website - email not available"
+    return {"ok": "Not found on website", "down": "Website not responding",
+            "blocked": "Website blocks automated access"}.get(l.site_state, "Not checked")

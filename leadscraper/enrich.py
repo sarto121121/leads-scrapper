@@ -5,14 +5,14 @@ import html as htmllib
 import ipaddress
 import re
 import threading
-from urllib.parse import urljoin, urlparse
+from urllib.parse import unquote, urljoin, urlparse
 from urllib.robotparser import RobotFileParser
 
 import phonenumbers
 import requests
 from bs4 import BeautifulSoup
 
-from .validate import clean_email
+from .validate import clean_email, same_site
 
 UA = "Mozilla/5.0 (compatible; LeadScraper/1.0; +contact-page-lookup)"
 CONTACT_HINTS = ("contact", "kontakt", "contacto", "contato", "contatti", "impressum", "about",
@@ -38,6 +38,7 @@ class SiteInfo:
         self.socials: dict[str, str] = {}
         self.error: str = ""
         self.reachable: bool = False   # the site's home page answered
+        self.robots_blocked: bool = False   # robots.txt forbids reading the home page
 
 
 class Robots:
@@ -108,7 +109,8 @@ def extract_emails(html: str) -> list[str]:
     soup = BeautifulSoup(html, "lxml")
     found: list[str] = []
     for a in soup.select('a[href^="mailto:" i]'):
-        found.append(htmllib.unescape(a["href"][7:]))
+        # a mailto may hold several addresses and is URL-encoded ("mailto:%20info@x.com")
+        found += re.split(r"[,;]", unquote(htmllib.unescape(a["href"][7:])).split("?")[0])
     for el in soup.select("[data-cfemail]"):
         found.append(_decode_cf(el["data-cfemail"]))
     for a in soup.select('a[href*="/cdn-cgi/l/email-protection#"]'):
@@ -120,6 +122,24 @@ def extract_emails(html: str) -> list[str]:
     found += EMAIL_FIND.findall(text)
     out = []
     for f in found:
+        e = clean_email(f)
+        if e and e not in out:
+            out.append(e)
+    return out
+
+
+_UNICODE_AT = re.compile(r"\\u0040|\\x40|&#0*64;|&#x0*40;|&commat;", re.I)
+
+
+def extract_embedded_emails(html: str) -> list[str]:
+    """Emails hidden in scripts / JSON-LD ("email":"info@x.pk"), which visible-text scanning misses.
+
+    These come from machine data, not what a visitor reads, so the caller must only trust the ones
+    on the business's own domain (scripts often contain third-party addresses).
+    """
+    raw = _UNICODE_AT.sub("@", html)
+    out: list[str] = []
+    for f in EMAIL_FIND.findall(raw):
         e = clean_email(f)
         if e and e not in out:
             out.append(e)
@@ -205,6 +225,7 @@ def crawl(website: str, region: str | None, session: requests.Session, robots: R
         if robots and not robots.allowed(page):
             if not expanded:
                 info.reachable = True   # can't verify politely; assume up
+                info.robots_blocked = True
             continue
         try:
             html, final, answered = _get(session, page, timeout)
@@ -220,6 +241,9 @@ def crawl(website: str, region: str | None, session: requests.Session, robots: R
         info.error = ""
         for e in extract_emails(html):
             if e not in info.emails:
+                info.emails.append(e)
+        for e in extract_embedded_emails(html):
+            if e not in info.emails and same_site(e.split("@")[1], url):
                 info.emails.append(e)
         for p in extract_phones(html, region):
             if p not in info.phones:

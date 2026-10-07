@@ -13,6 +13,9 @@ python -m leadscraper -c Pakistan -t Lahore -k dentist --areas "DHA,Gulberg,Joha
 Output: `leads_<type>_<city>_<country>.xlsx` with columns **Name, Phone, Email, Address,
 Website Present, Website**. *Website Present* is `Yes` (the link is in the *Website* column) or `No`.
 Facebook/Instagram/LinkedIn-style pages are not treated as a website.
+When there is no email the **Email** cell says why (grey italic): `Not found on website`,
+`No website - email not available`, `Website not responding`, `Website blocks automated access`,
+`Not checked` (with `--no-website-crawl`) or `Email found but its domain is invalid`.
 
 ### Exact number of leads
 ```bash
