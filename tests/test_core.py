@@ -144,6 +144,10 @@ def test_social_sites_not_crawled_and_region():
     assert normalize_url("https://www.facebook.com/abc") == ""
     assert country_region("Pakistan") == "PK" and country_region("de") == "DE"
     assert country_region("Narnia") is None
+    for name, code in {"UK": "GB", "UAE": "AE", "USA": "US", "Turkey": "TR", "South Korea": "KR",
+                       "Germany": "DE", "India": "IN", "Brazil": "BR", "Nigeria": "NG"}.items():
+        assert country_region(name) == code, name
+    assert country_region("zz") is None
 
 
 def test_maps_extract_js_markup():

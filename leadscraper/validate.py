@@ -131,13 +131,29 @@ def best_phone(raws: list[str], region: str | None) -> tuple[str, str, str]:
     return "", "", ""
 
 
+_COUNTRY_ALIASES = {
+    "uk": "GB", "united kingdom": "GB", "great britain": "GB", "england": "GB", "scotland": "GB",
+    "wales": "GB", "northern ireland": "GB", "uae": "AE", "u.a.e.": "AE", "usa": "US", "u.s.a.": "US",
+    "u.s.": "US", "america": "US", "turkey": "TR", "turkiye": "TR", "russia": "RU", "south korea": "KR",
+    "korea": "KR", "north korea": "KP", "vietnam": "VN", "iran": "IR", "syria": "SY", "laos": "LA",
+    "czech republic": "CZ", "czechia": "CZ", "ivory coast": "CI", "cote d'ivoire": "CI", "bolivia": "BO",
+    "venezuela": "VE", "tanzania": "TZ", "moldova": "MD", "palestine": "PS", "taiwan": "TW",
+    "hong kong": "HK", "macau": "MO", "kosovo": "XK", "brunei": "BN", "burma": "MM", "myanmar": "MM",
+    "ksa": "SA", "saudi": "SA", "holland": "NL", "the netherlands": "NL", "swaziland": "SZ",
+}
+
+
 def country_region(country: str) -> str | None:
-    """'Pakistan' -> 'PK' (None if unknown; a 2-letter code is returned as is)."""
-    c = country.strip()
-    if len(c) == 2 and c.isalpha():
-        return c.upper()
-    try:
-        import pycountry
-        return pycountry.countries.lookup(c).alpha_2
-    except (ImportError, LookupError):
-        return None
+    """'Pakistan' -> 'PK'. Accepts names, common aliases (UK, UAE, USA) and 2-letter codes.
+    Returns None if unknown or not a region phonenumbers supports."""
+    c = country.strip().lower()
+    code = _COUNTRY_ALIASES.get(c)
+    if not code and len(c) == 2 and c.isalpha():
+        code = c.upper()
+    if not code:
+        try:
+            import pycountry
+            code = pycountry.countries.lookup(country.strip()).alpha_2
+        except (ImportError, LookupError):
+            return None
+    return code if code in phonenumbers.SUPPORTED_REGIONS else None
