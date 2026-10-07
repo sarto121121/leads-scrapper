@@ -501,3 +501,103 @@ def test_browser_fallback_finds_js_built_email(monkeypatch):
     assert plain_only.email == "" and "Not found" in plain_only.email_note   # plain fetch cannot see JS content
     assert a.email == "ciao@demo.it" and threaded.email == "ciao@demo.it"   # the browser fallback can
     assert b.email == "" and b.email_note == "Not found on website" and b.site_state == "ok"
+
+
+# ---------- widening the search + history under --require-email ----------
+
+def test_ring_points_geometry():
+    import math
+    from leadscraper.maps import ring_points
+    pts = ring_points(45.45, 8.62, 15)
+    assert len(pts) == 6 + 12 + 18 and ring_points(45.45, 8.62, 4) == []
+
+    def km(a, b):
+        dy = (a[0] - b[0]) * 111.0
+        dx = (a[1] - b[1]) * 111.0 * math.cos(math.radians(45.45))
+        return math.hypot(dx, dy)
+    ring1 = [km(p, (45.45, 8.62)) for p in pts[:6]]
+    assert all(abs(d - 5.0) < 0.05 for d in ring1)
+    assert all(abs(km(p, (45.45, 8.62)) - 15.0) < 0.1 for p in pts[-18:])
+
+
+def test_require_email_reconsiders_leads_exported_without_email(tmp_path, monkeypatch):
+    state = {"second": False}
+
+    def fake(city, country, cat, log=print):
+        leads = [Lead("Has Email", cat, lat=1, lon=1, raw_phones=["+44 20 7946 0001"], raw_emails=["a@has.co.uk"]),
+                 Lead("Later Email", cat, lat=2, lon=2, raw_phones=["+44 20 7946 0002"],
+                      raw_emails=["b@later.co.uk"] if state["second"] else [])]
+        return leads, osm.Place("x", "GB", country, "relation", 1, (0, 0, 1, 1))
+    _, rows1 = _run_cli(tmp_path, monkeypatch, fake)                   # no email filter: both exported
+    assert {r[0] for r in rows1} == {"Has Email", "Later Email"}
+    state["second"] = True                                             # the crawler now finds Later's email
+    _, rows2 = _run_cli(tmp_path, monkeypatch, fake, "--require-email")
+    assert [r[0] for r in rows2] == ["Later Email"]                    # already-delivered "Has Email" is not repeated
+    _, rows3 = _run_cli(tmp_path, monkeypatch, fake, "--require-email")
+    assert rows3 == []                                                 # now both have been delivered with an email
+
+
+def test_maps_widens_search_when_city_runs_out(tmp_path, monkeypatch):
+    import glob, itertools, threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    exe = glob.glob("/opt/pw-browsers/chromium-*/chrome-linux*/chrome")
+    try:
+        import playwright  # noqa: F401
+    except ImportError:
+        return
+    if not exe:
+        return
+    monkeypatch.setenv("LEADSCRAPER_BROWSER_PATH", exe[0])
+    paths, counter = [], itertools.count()
+    batches = {}                                            # search path -> its 20 place ids
+
+    def feed(ids):
+        links = "".join('<a href="/maps/place/Biz%d/data=!4m2!3d45.46!4d8.62!1sID%d" aria-label="Biz %d" '
+                        'style="display:block;height:20px">Biz %d</a>' % (i, i, i, i) for i in ids)
+        return ('<html><body><h1>Results</h1><div role="feed" style="height:300px;overflow:auto">%s'
+                '<div>You\'ve reached the end of the list.</div></div></body></html>' % links)
+
+    class H(BaseHTTPRequestHandler):
+        def log_message(self, *a): pass
+        def do_GET(self):
+            if self.path.startswith("/maps/search/"):
+                paths.append(self.path)
+                if "/@" in self.path:                       # a ring search: 20 brand-new places each time
+                    base = 1000 + 100 * next(counter)
+                    batches.setdefault(self.path, range(base, base + 20))
+                else:                                       # the city itself: the same 20 places every time
+                    batches.setdefault("city", range(0, 20))
+                body = feed(batches.get(self.path) or batches["city"])
+            elif self.path.startswith("/maps/place/"):
+                i = int(self.path.split("/")[3][3:])
+                phone = ('<button data-item-id="phone:tel:x" aria-label="Phone: 020 7946 %04d"></button>' % i) if i % 2 == 0 else ""
+                body = ('<html><body><h1>Biz %d</h1><button data-item-id="address" aria-label="Address: %d St">'
+                        '</button>%s</body></html>' % (i, i, phone))
+            else:
+                self.send_response(404); self.end_headers(); return
+            self.send_response(200); self.send_header("Content-Type", "text/html"); self.end_headers()
+            self.wfile.write(body.encode())
+
+    srv = HTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    from leadscraper import cli, maps
+    monkeypatch.setattr(maps, "SEARCH_URL", "http://127.0.0.1:%d/maps/search/{q}" % srv.server_port)
+    out = tmp_path / "w.xlsx"
+    try:
+        rc = cli.main(["-c", "UK", "-t", "London", "-k", "dentist", "-n", "25", "-o", str(out), "--radius", "10",
+                       "--no-website-crawl", "--no-dns-check"])
+        rows = list(openpyxl.load_workbook(out)["Leads"].iter_rows(min_row=2, values_only=True))
+        grid_hits = [p for p in paths if "/@" in p]
+        # same request with widening switched off can only ever return the 10 phone-bearing city places
+        out2 = tmp_path / "strict.xlsx"
+        monkeypatch.setenv("LEADSCRAPER_HISTORY", str(tmp_path / "other_history.json"))
+        paths.clear()
+        cli.main(["-c", "UK", "-t", "London", "-k", "dentist", "-n", "25", "-o", str(out2), "--radius", "0",
+                  "--no-website-crawl", "--no-dns-check"])
+        strict = list(openpyxl.load_workbook(out2)["Leads"].iter_rows(min_row=2, values_only=True))
+        strict_grid = [p for p in paths if "/@" in p]
+    finally:
+        srv.shutdown()
+    assert rc == 0 and len(rows) == 25 and all(r[1] for r in rows)
+    assert 1 <= len(grid_hits) <= 3 and ",14z" in grid_hits[0]          # widened, and stopped as soon as it had 25
+    assert len(strict) == 10 and strict_grid == []                      # --radius 0 stays inside the city

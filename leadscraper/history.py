@@ -22,7 +22,9 @@ def identities(l: Lead) -> dict[str, str]:
 
 
 class History:
-    FIELDS = ("ids", "phones", "emails", "keys")
+    # e_* hold the same identities for leads that were delivered WITH an email. With --require-email a lead
+    # earlier exported without one is not "done": it can still become a lead once an email is found.
+    FIELDS = ("ids", "phones", "emails", "keys", "e_ids", "e_phones", "e_keys")
 
     def __init__(self, path: Path | None = None):
         self.path = path
@@ -42,18 +44,26 @@ class History:
     def exported(self) -> int:
         return len(self.data["keys"])
 
-    @property
-    def place_ids(self) -> set[str]:
-        return self.data["ids"]
+    def skip_ids(self, need_email: bool = False) -> set[str]:
+        """Listing ids that need no further work (Maps skips opening these places)."""
+        return self.data["e_ids" if need_email else "ids"]
 
-    def seen(self, l: Lead) -> bool:
-        return any(v and v in self.data[f] for f, v in identities(l).items())
+    def seen(self, l: Lead, need_email: bool = False) -> bool:
+        ident = identities(l)
+        if not need_email:
+            return any(v and v in self.data[f] for f, v in ident.items())
+        if l.email and l.email in self.data["emails"]:
+            return True
+        return any(ident[f] and ident[f] in self.data["e_" + f] for f in ("ids", "phones", "keys"))
 
     def add(self, leads: list[Lead]) -> None:
         for l in leads:
-            for f, v in identities(l).items():
+            ident = identities(l)
+            for f, v in ident.items():
                 if v:
                     self.data[f].add(v)
+                    if l.email and f != "emails":
+                        self.data["e_" + f].add(v)
 
     def save(self) -> None:
         if not self.path:

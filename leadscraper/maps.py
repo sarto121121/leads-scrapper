@@ -8,7 +8,9 @@ Scraping Google Maps is against Google's Terms of Service; for official access u
 from __future__ import annotations
 
 import asyncio
+import math
 import re
+import statistics
 from urllib.parse import quote
 
 from .browser import launch_kwargs
@@ -57,9 +59,9 @@ async def _accept_consent(page) -> None:
             pass
 
 
-async def _open_search(page, query: str) -> str:
-    """Open a search. Returns 'feed' (result list), 'single' (jumped to one place) or 'none'."""
-    await page.goto(SEARCH_URL.format(q=quote(query)), wait_until="domcontentloaded", timeout=45000)
+async def _open_search(page, url: str) -> str:
+    """Open a search URL. Returns 'feed' (result list), 'single' (jumped to one place) or 'none'."""
+    await page.goto(url, wait_until="domcontentloaded", timeout=45000)
     await _accept_consent(page)
     if "/sorry/" in page.url:
         raise MapsError("Google is asking for a captcha (too many requests). Wait a while, or run with "
@@ -114,14 +116,30 @@ async def _detail(ctx, url: str, sem: asyncio.Semaphore) -> dict | None:
             await page.close()
 
 
+def ring_points(lat: float, lon: float, radius_km: float, step_km: float = 5.0) -> list[tuple[float, float]]:
+    """Search centres on concentric rings around (lat, lon): 6 points at step_km, 12 at 2*step_km, ..."""
+    pts: list[tuple[float, float]] = []
+    k = 1
+    kx = 111.0 * max(0.1, math.cos(math.radians(lat)))      # km per degree of longitude here
+    while k * step_km <= radius_km + 1e-9:
+        n = 6 * k
+        for i in range(n):
+            ang = 2 * math.pi * i / n
+            pts.append((lat + k * step_km * math.cos(ang) / 111.0, lon + k * step_km * math.sin(ang) / kx))
+        k += 1
+    return pts
+
+
 async def _run(queries: list[str], category: str, city: str, country: str, on_batch,
-               batch_size: int, headless: bool, concurrency: int, log, skip_ids: frozenset[str] = frozenset()) -> None:
+               batch_size: int, headless: bool, concurrency: int, log,
+               skip_ids: frozenset[str] = frozenset(), radius_km: float = 0) -> None:
     try:
         from playwright.async_api import async_playwright
     except ImportError as e:
         raise MapsError("Playwright is not installed. Run:  pip install playwright  and then  "
                         "python -m playwright install chromium") from e
     seen_ids: set[str] = set()
+    coords: list[tuple[float, float]] = []
     async with async_playwright() as pw:
         try:
             browser = await pw.chromium.launch(**launch_kwargs(headless))
@@ -138,41 +156,63 @@ async def _run(queries: list[str], category: str, city: str, country: str, on_ba
                 await route.continue_()
         await ctx.route("**/*", skip_heavy)
 
+        async def run_one(label: str, url: str) -> bool:
+            """Work through one search. Returns True when the caller says it has enough leads."""
+            log(f"Google Maps search: {label}")
+            page = await ctx.new_page()
+            try:
+                mode = await _open_search(page, url)
+                items: dict[str, str] = {}
+                done_urls: set[str] = set()
+                ended = mode != "feed"
+                if mode == "single":
+                    items[page.url] = ""
+                while mode != "none":
+                    if not ended:
+                        ended = await _scroll_until(page, items, len(done_urls) + batch_size, log)
+                    fresh = [(u, n) for u, n in items.items() if u not in done_urls]
+                    # places already read under an earlier search count as handled
+                    done_urls.update(u for u, _ in fresh if _place_id(u) in seen_ids or _place_id(u) in skip_ids)
+                    new = [(u, n) for u, n in fresh if u not in done_urls][:batch_size]
+                    if not new:
+                        if ended:
+                            break
+                        continue
+                    done_urls.update(u for u, _ in new)
+                    seen_ids.update(_place_id(u) for u, _ in new)
+                    log(f"  reading {len(new)} places ({len(done_urls)} listed so far) ...")
+                    sem = asyncio.Semaphore(concurrency)
+                    details = await asyncio.gather(*[_detail(ctx, u, sem) for u, _ in new])
+                    batch = [_to_lead(d, u, n, category, city, country)
+                             for (u, n), d in zip(new, details) if d and not d.get("closed")]
+                    batch = [b for b in batch if b]
+                    coords.extend((b.lat, b.lon) for b in batch if b.lat is not None and b.lon is not None)
+                    # enrichment is slow blocking work: keep it off the browser's event loop
+                    if await asyncio.to_thread(on_batch, batch):
+                        return True
+                return False
+            finally:
+                await page.close()
+
         try:
-            for q in queries:
-                log(f"Google Maps search: {q}")
-                page = await ctx.new_page()
-                try:
-                    mode = await _open_search(page, q)
-                    items: dict[str, str] = {}
-                    done_urls: set[str] = set()
-                    ended = mode != "feed"
-                    if mode == "single":
-                        items[page.url] = ""
-                    while mode != "none":
-                        if not ended:
-                            ended = await _scroll_until(page, items, len(done_urls) + batch_size, log)
-                        fresh = [(u, n) for u, n in items.items() if u not in done_urls]
-                        # places already read under an earlier search count as handled
-                        done_urls.update(u for u, _ in fresh if _place_id(u) in seen_ids or _place_id(u) in skip_ids)
-                        new = [(u, n) for u, n in fresh if u not in done_urls][:batch_size]
-                        if not new:
-                            if ended:
-                                break
-                            continue
-                        done_urls.update(u for u, _ in new)
-                        seen_ids.update(_place_id(u) for u, _ in new)
-                        log(f"  reading {len(new)} places ({len(done_urls)} listed so far) ...")
-                        sem = asyncio.Semaphore(concurrency)
-                        details = await asyncio.gather(*[_detail(ctx, u, sem) for u, _ in new])
-                        batch = [_to_lead(d, u, n, category, city, country)
-                                 for (u, n), d in zip(new, details) if d and not d.get("closed")]
-                        batch = [b for b in batch if b]
-                        # enrichment is slow blocking work: keep it off the browser's event loop
-                        if await asyncio.to_thread(on_batch, batch):
-                            return
-                finally:
-                    await page.close()
+            plan = [(q, SEARCH_URL.format(q=quote(q))) for q in queries]
+            widened, i = False, 0
+            while i < len(plan):
+                label, url = plan[i]
+                i += 1
+                if await run_one(label, url):
+                    return
+                if i == len(plan) and radius_km and not widened:
+                    widened = True
+                    if len(coords) >= 3:    # centre of what we found = centre of the city
+                        lat = statistics.median(c[0] for c in coords)
+                        lon = statistics.median(c[1] for c in coords)
+                        pts = ring_points(lat, lon, radius_km)
+                        log(f"City listings used up - widening the search ring by ring (up to {radius_km:g} km "
+                            f"around the centre, {len(pts)} extra searches; stops as soon as you have enough).")
+                        for la, lo in pts:
+                            plan.append((f"{category} around {la:.3f},{lo:.3f}",
+                                         SEARCH_URL.format(q=f"{quote(category)}/@{la:.5f},{lo:.5f},14z")))
         finally:
             await browser.close()
 
@@ -198,14 +238,16 @@ def _place_id(url: str) -> str:
 
 def search(city: str, country: str, category: str, on_batch, areas: list[str] | None = None,
            more_queries: bool = False, batch_size: int = 20, headless: bool = True,
-           concurrency: int = 4, log=print, skip_ids: frozenset[str] = frozenset()) -> None:
+           concurrency: int = 4, log=print, skip_ids: frozenset[str] = frozenset(),
+           radius_km: float = 0) -> None:
     """Stream results to on_batch(list[Lead]) -> bool. Stop as soon as it returns True.
 
-    more_queries adds a few differently-worded searches to dig deeper when a target count is not met.
+    more_queries adds differently-worded searches when a target count is not met; radius_km > 0 then
+    widens the search ring by ring around the city centre (Maps shows ~120 places per search).
     """
     base = [f"{category} in {a}, {city}, {country}" for a in areas] if areas \
         else [f"{category} in {city}, {country}"]
     if more_queries:
-        base += [f"best {category} in {city}, {country}", f"{category} near {city}, {country}",
-                 f"{category} {city} {country} contact"]
-    asyncio.run(_run(base, category, city, country, on_batch, batch_size, headless, concurrency, log, skip_ids))
+        base += [f"best {category} in {city}, {country}", f"{category} near {city}, {country}"]
+    asyncio.run(_run(base, category, city, country, on_batch, batch_size, headless, concurrency, log,
+                     skip_ids, radius_km))

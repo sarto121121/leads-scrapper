@@ -32,6 +32,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         "API (needs GOOGLE_MAPS_API_KEY); osm = OpenStreetMap; all = everything")
     p.add_argument("--areas", help="Comma-separated neighbourhoods to search one by one for MORE results, "
                    "e.g. 'DHA,Gulberg,Johar Town' (Google shows ~120 results per search)")
+    p.add_argument("--radius", type=float, default=15, metavar="KM",
+                   help="With -n: when the city's own listings run out, keep searching in rings around the "
+                        "city centre up to this many km (default 15; 0 = stay strictly inside the city)")
     p.add_argument("--show-browser", action="store_true", help="Show the browser window (to solve a captcha)")
     p.add_argument("--region", help="Two-letter country code for phone parsing (auto-detected normally)")
     p.add_argument("-n", "--count", "--limit", dest="count", type=int, default=0,
@@ -76,7 +79,7 @@ class Collector:
         self.skipped = 0
 
     def _known(self, l: Lead) -> bool:
-        return self.run.seen(l) or (not self.a.include_seen and self.hist.seen(l))
+        return self.run.seen(l) or (not self.a.include_seen and self.hist.seen(l, self.a.require_email))
 
     def qualifies(self, l: Lead) -> bool:
         a = self.a
@@ -160,7 +163,8 @@ def main(argv: list[str] | None = None) -> int:
             try:
                 maps.search(a.city, a.country, cat, col.feed, areas, more_queries=bool(a.count),
                             headless=not a.show_browser, log=_log,
-                            skip_ids=frozenset() if a.include_seen else frozenset(hist.place_ids))
+                            skip_ids=frozenset() if a.include_seen else frozenset(hist.skip_ids(a.require_email)),
+                            radius_km=a.radius if a.count else 0)
             except maps.MapsError as e:
                 _log(f"Google Maps: {e}")
                 if not (use_api or use_osm) and not col.leads:
@@ -182,8 +186,8 @@ def main(argv: list[str] | None = None) -> int:
         leads = col.leads[:a.count] if a.count else col.leads
         if a.count and len(leads) < a.count:
             _log(f"Only {len(leads)} of the {a.count} requested '{cat}' leads exist for these filters. "
-                 f"To get more: add --areas \"Area1,Area2,...\", pick a larger city, or relax "
-                 f"--require-email/--require-phone/--website.")
+                 f"To get more: raise --radius (now {a.radius:g} km), add --areas \"Area1,Area2,...\", "
+                 f"try another business type, or relax --require-email/--require-phone/--website.")
         if col.skipped:
             _log(f"  skipped {col.skipped} leads already exported before or duplicated in this run")
         skipped_total += col.skipped
