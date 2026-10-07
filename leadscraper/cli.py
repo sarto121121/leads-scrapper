@@ -6,7 +6,7 @@ import sys
 from . import maps, osm, places
 from .export import safe_filename, write_xlsx
 from .models import Lead
-from .pipeline import enrich_all, finalize, lead_key, merge
+from .pipeline import clean_website, enrich_all, finalize, lead_key, merge
 from .validate import country_region
 
 
@@ -35,7 +35,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         "many complete leads (0 = take everything found)")
     p.add_argument("--website", choices=["any", "yes", "no"], default="any",
                    help="yes = only businesses that have a website; no = only those WITHOUT one "
-                        "(or only a Facebook/Instagram page)")
+                        "(a Facebook/Instagram page does not count as a website)")
     p.add_argument("--keep-incomplete", action="store_true",
                    help="Also keep leads that have neither a phone nor an email (dropped by default)")
     p.add_argument("--no-website-crawl", action="store_true", help="Skip visiting websites (faster, fewer emails)")
@@ -71,7 +71,7 @@ class Collector:
             return False
         if a.require_phone and not l.phone:
             return False
-        has_site = l.website_status.startswith("Yes")
+        has_site = bool(l.website)
         return not ((a.website == "yes" and not has_site) or (a.website == "no" and has_site))
 
     @property
@@ -81,6 +81,8 @@ class Collector:
     def feed(self, batch: list[Lead]) -> bool:
         """Process a batch; return True when the wanted number of leads has been reached."""
         fresh = []
+        for l in batch:
+            clean_website(l)
         for l in merge(batch):
             k = lead_key(l)
             if k not in self.seen:
@@ -156,5 +158,5 @@ def main(argv: list[str] | None = None) -> int:
                              "Sources": ", ".join(sorted({x for l in result for x in l.source.split(' + ')}))})
     _log(f"\nDone: {len(result)} leads "
          f"({sum(bool(l.email) for l in result)} with email, {sum(bool(l.phone) for l in result)} with phone, "
-         f"{sum(l.website_status.startswith('Yes') for l in result)} with website)\nSaved to {out}")
+         f"{sum(bool(l.website) for l in result)} with website)\nSaved to {out}")
     return 0

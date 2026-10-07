@@ -11,8 +11,8 @@ python -m leadscraper -c Pakistan -t Lahore -k dentist --areas "DHA,Gulberg,Joha
 ```
 
 Output: `leads_<type>_<city>_<country>.xlsx` with columns **Name, Phone, Email, Address,
-Website Present, Website**. *Website Present* is `Yes`, `Yes (not loading)` (listed but the site did
-not answer), `Social page only` (just Facebook/Instagram/etc.) or `No`.
+Website Present, Website**. *Website Present* is `Yes` (the link is in the *Website* column) or `No`.
+Facebook/Instagram/LinkedIn-style pages are not treated as a website.
 
 ### Exact number of leads
 ```bash

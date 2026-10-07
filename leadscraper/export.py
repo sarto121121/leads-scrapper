@@ -52,9 +52,8 @@ def write_xlsx(leads: list[Lead], path: str, meta: dict[str, str]) -> None:
         ("Total leads", n),
         ("With email", sum(bool(l.email) for l in leads)),
         ("With phone", sum(bool(l.phone) for l in leads)),
-        ("With a website", sum(l.website_status.startswith("Yes") for l in leads)),
-        ("Social page only", sum(l.website_status == "Social page only" for l in leads)),
-        ("No website", sum(l.website_status == "No" for l in leads)),
+        ("With a website", sum(bool(l.website) for l in leads)),
+        ("No website", sum(not l.website for l in leads)),
         ("With email AND phone", sum(bool(l.email and l.phone) for l in leads)),
         ("Note", "Emails are only listed when found on the business's own listing/website and the "
                  "domain accepts mail. Phones are only listed when they are valid for their country."),

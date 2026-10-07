@@ -17,6 +17,16 @@ def lead_key(l: Lead) -> str:
     return f"{host}|{name}" if host else f"{name}|{re.sub(r'[^0-9]', '', l.raw_phones[0])[-8:] if l.raw_phones else l.address.lower()}"
 
 
+def clean_website(l: Lead) -> None:
+    """Keep only a real business website: Facebook/Instagram/etc. pages count as 'no website'."""
+    w = l.website.strip()
+    if w and is_social(w):
+        w = ""
+    elif w and not re.match(r"^[a-z][a-z0-9+.\-]*://", w, re.I):
+        w = "http://" + w
+    l.website = w
+
+
 def merge(leads: list[Lead]) -> list[Lead]:
     """Drop duplicates, filling gaps in the first-seen record from later ones."""
     out: dict[str, Lead] = {}
@@ -57,11 +67,7 @@ def enrich_all(leads: list[Lead], region: str | None, workers: int = 24, timeout
     lock = threading.Lock()
 
     def work(l: Lead) -> None:
-        if is_social(l.website):
-            l.website_status = "Social page only"   # nothing to crawl on a Facebook/Instagram page
-            return
         info = crawl(l.website, region, session, robots, timeout)
-        l.website_status = "Yes" if info.reachable else "Yes (not loading)"
         l.raw_emails += [e for e in info.emails if e not in l.raw_emails]
         # phones from the website are only a fallback, listed after directory data
         l.raw_phones += [p for p in info.phones[:3] if p not in l.raw_phones]
@@ -86,10 +92,7 @@ def enrich_all(leads: list[Lead], region: str | None, workers: int = 24, timeout
 def finalize(leads: list[Lead], region: str | None, check_dns: bool = True) -> None:
     """Validate raw emails/phones into the final exported fields."""
     def one(l: Lead) -> None:
-        if not l.website:
-            l.website_status = "No"
-        elif not l.website_status:   # not crawled (--no-website-crawl)
-            l.website_status = "Social page only" if is_social(l.website) else "Yes"
+        l.website_status = "Yes" if l.website else "No"
         l.phone, l.phone_display, l.phone_type = best_phone(l.raw_phones, region)
         l.email, l.other_emails, l.email_status = verify_emails(l.raw_emails, l.website, check_dns)
     with ThreadPoolExecutor(max_workers=16) as ex:

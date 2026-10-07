@@ -212,9 +212,12 @@ def test_count_larger_than_available_returns_what_exists(tmp_path, monkeypatch):
 def test_website_status_column_and_filters(tmp_path, monkeypatch):
     rc, rows = _run_cli(tmp_path, monkeypatch, _fake_osm(9))
     status = {r[0]: r[4] for r in rows}
-    assert status["Biz 1"] == "Yes" and status["Biz 3"] == "Social page only" and status["Biz 2"] == "No"
+    link = {r[0]: r[5] for r in rows}
+    assert status["Biz 1"] == "Yes" and link["Biz 1"] == "https://biz1.com"
+    assert status["Biz 3"] == "No" and link["Biz 3"] is None      # Facebook page is not a website
+    assert status["Biz 2"] == "No"
     _, rows = _run_cli(tmp_path, monkeypatch, _fake_osm(9), "--website", "no")
-    assert {r[4] for r in rows} == {"No", "Social page only"}
+    assert {r[4] for r in rows} == {"No"}
     _, rows = _run_cli(tmp_path, monkeypatch, _fake_osm(9), "--website", "yes")
     assert {r[4] for r in rows} == {"Yes"}
 
@@ -291,3 +294,12 @@ f.addEventListener('scroll', () => { if (f.scrollTop + f.clientHeight >= f.scrol
     assert rc == 0 and len(rows) == 15 and all(r[1] for r in rows)
     assert len(set(hits)) < TOTAL          # stopped early instead of reading every place
     assert max(hits) >= 25                 # had to scroll past the first 20 to find 15 with phones
+
+
+def test_clean_website_drops_social_and_adds_scheme():
+    from leadscraper.pipeline import clean_website
+    for url, want in [("https://www.facebook.com/shop", ""), ("instagram.com/shop", ""),
+                      ("smile.pk", "http://smile.pk"), ("https://smile.pk/", "https://smile.pk/"), ("", "")]:
+        l = Lead("x", website=url)
+        clean_website(l)
+        assert l.website == want, url
