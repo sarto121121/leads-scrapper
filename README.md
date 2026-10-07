@@ -40,6 +40,19 @@ A lead counts as already seen if its Google listing, phone, email, or name+websi
 (e.g. one per client). Leads are recorded only after the Excel file is saved successfully.
 When every match has been exported already, use `--areas` or another city/type.
 
+### Getting emails (cold emailing)
+Emails come from the business's own website (Google Maps does not publish them), so a business with
+no website cannot have one found. Roughly half of small local businesses have no website. For a list
+where **every** row has an email, use:
+```bash
+python -m leadscraper -c Italy -t Novara -k "centro estetico" -n 50 --require-email
+```
+It keeps searching (more listings, differently-worded searches, `--areas`) until it has 50 such leads.
+To find emails the tool opens the home page and contact pages (also guessed ones such as `/contatti`,
+`/contact`, `/kontakt`), retries the `http`/`https`/`www` variants, tolerates broken certificates, and for
+sites that still show nothing (JavaScript-built pages, bot filters) re-reads them in a real browser
+(`--no-render` turns that off for speed). Certified-mail (PEC) addresses are ranked last.
+
 ## How it works
 1. **Find businesses** – default: Google Maps in a real browser (scrolls the whole list, opens every place; no key). Other sources: `--source api` (official Google Places API), `osm`, `all`. OpenStreetMap (Nominatim + Overpass), free, worldwide, no key.
    Optional: set `GOOGLE_MAPS_API_KEY` to also pull Google Places (usually better phone/website

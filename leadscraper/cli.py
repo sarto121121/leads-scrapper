@@ -47,6 +47,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--keep-incomplete", action="store_true",
                    help="Also keep leads that have neither a phone nor an email (dropped by default)")
     p.add_argument("--no-website-crawl", action="store_true", help="Skip visiting websites (faster, fewer emails)")
+    p.add_argument("--no-render", action="store_true",
+                   help="Skip the browser fallback that re-reads websites where no email was found (faster)")
     p.add_argument("--no-dns-check", action="store_true", help="Skip email domain verification")
     p.add_argument("--require-email", action="store_true", help="Keep only leads that have a verified email")
     p.add_argument("--require-phone", action="store_true", help="Keep only leads that have a valid phone")
@@ -109,7 +111,8 @@ class Collector:
             if self.a.no_website_crawl:
                 finalize(fresh, self.region, not self.a.no_dns_check)
             else:
-                enrich_all(fresh, self.region, self.a.workers, self.a.timeout, not self.a.no_dns_check, _log)
+                enrich_all(fresh, self.region, self.a.workers, self.a.timeout, not self.a.no_dns_check, _log,
+                           render=not self.a.no_render)
             for l in fresh:
                 if not self.qualifies(l):
                     continue
@@ -211,4 +214,9 @@ def main(argv: list[str] | None = None) -> int:
          f"({sum(bool(l.email) for l in result)} with email, {sum(bool(l.phone) for l in result)} with phone, "
          f"{sum(bool(l.website) for l in result)} with website)\nSaved to {out}\n"
          f"History: {hist.exported} leads remembered in {hist_path} (next run returns only new ones)")
+    no_site = sum(not l.website for l in result)
+    if not a.require_email and sum(bool(l.email) for l in result) < 0.7 * len(result):
+        _log(f"Tip: {no_site} of these {len(result)} leads have no website, so there is no page to read an "
+             f"email from. For cold emailing add --require-email (with -n N): it keeps searching until it "
+             f"has N leads that ALL have an email.")
     return 0

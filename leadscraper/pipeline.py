@@ -7,6 +7,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urlparse
 
 from .enrich import Robots, crawl, is_social, make_session
+from .render import render_missing
 from .models import Lead
 from .validate import best_phone, verify_emails
 
@@ -59,7 +60,7 @@ def _close(a: Lead | None, b: Lead) -> bool:
 
 
 def enrich_all(leads: list[Lead], region: str | None, workers: int = 24, timeout: float = 8.0,
-               check_dns: bool = True, log=print) -> None:
+               check_dns: bool = True, log=print, render: bool = True) -> None:
     session = make_session()
     robots = Robots(session, timeout)
     todo = [l for l in leads if l.website]
@@ -68,7 +69,8 @@ def enrich_all(leads: list[Lead], region: str | None, workers: int = 24, timeout
 
     def work(l: Lead) -> None:
         info = crawl(l.website, region, session, robots, timeout)
-        l.site_state = "blocked" if info.robots_blocked else "ok" if info.reachable else "down"
+        l.site_state = ("ok" if info.fetched else "blocked" if info.robots_blocked or info.reachable
+                        else "down")   # reachable but no HTML = the site answered with an error (403 ...)
         l.raw_emails += [e for e in info.emails if e not in l.raw_emails]
         # phones from the website are only a fallback, listed after directory data
         l.raw_phones += [p for p in info.phones[:3] if p not in l.raw_phones]
@@ -87,6 +89,9 @@ def enrich_all(leads: list[Lead], region: str | None, workers: int = 24, timeout
                     f.result()
                 except Exception as e:  # one broken site must never kill the run
                     log(f"  warning: {type(e).__name__}: {e}")
+    if render:
+        # sites with no email yet (JavaScript-built pages, bot filters): read them like a visitor would
+        render_missing([l for l in todo if not l.raw_emails], region, log=log)
     finalize(leads, region, check_dns)
 
 
@@ -104,7 +109,7 @@ def finalize(leads: list[Lead], region: str | None, check_dns: bool = True) -> N
 def _why_no_email(l: Lead) -> str:
     """Say why a lead has no email instead of leaving the cell blank."""
     if l.raw_emails:
-        return "Email found but its domain is invalid"
+        return f"Found {', '.join(l.raw_emails[:2])} but that address cannot receive mail"
     if not l.website:
         return "No website - email not available"
     return {"ok": "Not found on website", "down": "Website not responding",

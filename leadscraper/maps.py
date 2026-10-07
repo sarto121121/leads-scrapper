@@ -8,10 +8,10 @@ Scraping Google Maps is against Google's Terms of Service; for official access u
 from __future__ import annotations
 
 import asyncio
-import os
 import re
 from urllib.parse import quote
 
+from .browser import launch_kwargs
 from .models import Lead
 
 SEARCH_URL = "https://www.google.com/maps/search/{q}?hl=en"
@@ -124,10 +124,7 @@ async def _run(queries: list[str], category: str, city: str, country: str, on_ba
     seen_ids: set[str] = set()
     async with async_playwright() as pw:
         try:
-            # LEADSCRAPER_BROWSER_PATH lets you use an already-installed Chrome/Chromium instead
-            browser = await pw.chromium.launch(
-                headless=headless, executable_path=os.environ.get("LEADSCRAPER_BROWSER_PATH") or None,
-                args=["--no-sandbox"] if getattr(os, "geteuid", lambda: 1)() == 0 else [])
+            browser = await pw.chromium.launch(**launch_kwargs(headless))
         except Exception as e:
             if "Executable doesn't exist" in str(e):
                 raise MapsError("Browser not installed. Run:  python -m playwright install chromium") from e

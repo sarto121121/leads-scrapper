@@ -10,25 +10,32 @@ from urllib.robotparser import RobotFileParser
 
 import phonenumbers
 import requests
+import urllib3
 from bs4 import BeautifulSoup
 
 from .validate import clean_email, same_site
 
-UA = "Mozilla/5.0 (compatible; LeadScraper/1.0; +contact-page-lookup)"
-CONTACT_HINTS = ("contact", "kontakt", "contacto", "contato", "contatti", "impressum", "about",
-                 "reach", "get-in-touch", "nous-contacter", "iletisim", "support", "connect")
+UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+      "Chrome/124.0.0.0 Safari/537.36")
+HEADERS = {"User-Agent": UA, "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+           "Accept-Language": "en-US,en;q=0.9", "Upgrade-Insecure-Requests": "1"}
+CONTACT_HINTS = ("contact", "contatt", "kontakt", "contacto", "contato", "impressum", "dove-siamo",
+                 "dove siamo", "chi-siamo", "chi siamo", "quienes-somos", "nous-joindre", "contactez",
+                 "get-in-touch", "reach", "iletisim", "fale-conosco", "about", "info", "support", "connect")
 SOCIALS = {"facebook.com": "facebook", "instagram.com": "instagram", "linkedin.com": "linkedin",
            "twitter.com": "twitter", "x.com": "twitter", "youtube.com": "youtube",
            "tiktok.com": "tiktok", "wa.me": "whatsapp", "api.whatsapp.com": "whatsapp"}
 EMAIL_FIND = re.compile(r"[A-Za-z0-9._%+\-]{1,64}@[A-Za-z0-9\-]+(?:\.[A-Za-z0-9\-]+)*\.[A-Za-z]{2,24}")
-OBFUSCATED = re.compile(r"\s*[\[\(\{]\s*(?:at|@)\s*[\]\)\}]\s*", re.I)
-OBFUSCATED_DOT = re.compile(r"\s*[\[\(\{]\s*dot\s*[\]\)\}]\s*", re.I)
+OBFUSCATED = re.compile(r"\s*[\[\(\{]\s*(?:at|@|chiocciola|arroba|ät)\s*[\]\)\}]\s*", re.I)
+OBFUSCATED_DOT = re.compile(r"\s*[\[\(\{]\s*(?:dot|punto|ponto|point)\s*[\]\)\}]\s*", re.I)
 MAX_BYTES = 1_500_000
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 SKIP_HOSTS = {"facebook.com", "instagram.com", "linkedin.com", "twitter.com", "x.com", "tiktok.com",
               "youtube.com", "wa.me", "linktr.ee", "business.site", "g.page", "goo.gl", "maps.google.com"}
 SOCIAL_HOSTS = {"facebook.com", "instagram.com", "linkedin.com", "twitter.com", "x.com", "tiktok.com",
                 "youtube.com", "wa.me", "linktr.ee"}
-GUESS_PATHS = ("/contact", "/contact-us", "/contact.html", "/contactus", "/about", "/about-us")
+GUESS_PATHS = ("/contatti", "/contact", "/contacts", "/contact-us", "/contattaci", "/kontakt", "/contacto",
+               "/contactez-nous", "/chi-siamo", "/about")
 
 
 class SiteInfo:
@@ -37,8 +44,10 @@ class SiteInfo:
         self.phones: list[str] = []
         self.socials: dict[str, str] = {}
         self.error: str = ""
-        self.reachable: bool = False   # the site's home page answered
+        self.reachable: bool = False   # something answered (even an HTTP error such as 403)
+        self.fetched: bool = False     # we actually got the home page HTML
         self.robots_blocked: bool = False   # robots.txt forbids reading the home page
+        self.status: int | None = None
 
 
 class Robots:
@@ -192,78 +201,113 @@ def _contact_links(html: str, base: str, limit: int) -> list[str]:
     return out[:limit]
 
 
-def _get(session: requests.Session, url: str, timeout: float) -> tuple[str, str, bool]:
-    """Return (html, final_url, answered). answered=True for any non-error HTTP response."""
-    r = session.get(url, timeout=timeout, stream=True, allow_redirects=True)
+def _candidates(url: str) -> list[str]:
+    """The address plus its likely twins: other scheme (http/https) and with/without 'www.'."""
+    p = urlparse(url)
+    host, port = p.hostname or "", f":{p.port}" if p.port else ""
+    hosts = [host, host[4:] if host.startswith("www.") else "www." + host]
+    schemes = [p.scheme, "https" if p.scheme == "http" else "http"]
+    out: list[str] = []
+    for sch in schemes:
+        for h in hosts:
+            c = p._replace(scheme=sch, netloc=h + port).geturl()
+            if c not in out:
+                out.append(c)
+    return out[:4]
+
+
+def _get(session: requests.Session, url: str, timeout: float) -> tuple[str, str, int]:
+    """Return (html, final_url, status). html is '' for errors / non-HTML. Raises on network failure."""
+    kw = dict(timeout=timeout, stream=True, allow_redirects=True)
     try:
-        if not r.ok:
-            return "", r.url, False
-        if "html" not in r.headers.get("content-type", "html").lower():
-            return "", r.url, True
-        body = r.raw.read(MAX_BYTES, decode_content=True)
-        return body.decode(r.encoding or "utf-8", errors="replace"), r.url, True
+        r = session.get(url, **kw)
+    except requests.exceptions.SSLError:
+        # expired / self-signed certificates are common on small business sites; we only read public pages
+        r = session.get(url, verify=False, **kw)
+    except requests.exceptions.Timeout:
+        r = session.get(url, **{**kw, "timeout": timeout * 1.5})   # slow shared hosting: one patient retry
+    try:
+        html = ""
+        if r.ok and "html" in r.headers.get("content-type", "html").lower():
+            body = r.raw.read(MAX_BYTES, decode_content=True)
+            html = body.decode(r.encoding or "utf-8", errors="replace")
+        return html, r.url, r.status_code
     finally:
         r.close()
 
 
+def _absorb(info: SiteInfo, html: str, urls: list[str], region: str | None) -> None:
+    """Collect emails / phones / socials from one page into info."""
+    for e in extract_emails(html):
+        if e not in info.emails:
+            info.emails.append(e)
+    for e in extract_embedded_emails(html):   # machine data: trust only the business's own domain
+        if e not in info.emails and any(same_site(e.split("@")[1], u) for u in urls):
+            info.emails.append(e)
+    for p in extract_phones(html, region):
+        if p not in info.phones:
+            info.phones.append(p)
+    for k, v in extract_socials(html).items():
+        info.socials.setdefault(k, v)
+
+
+def _first_page(url: str, session: requests.Session, robots: Robots | None, timeout: float,
+                info: SiteInfo) -> tuple[str, str] | None:
+    for cand in _candidates(url):
+        if robots and not robots.allowed(cand):
+            info.robots_blocked = info.reachable = True   # we respect robots.txt; browser fallback may still read it
+            return None
+        try:
+            html, final, status = _get(session, cand, timeout)
+        except requests.RequestException as e:
+            info.error = type(e).__name__
+            continue
+        info.reachable, info.status = True, status
+        if html:
+            info.error = ""
+            info.fetched = True
+            return html, final
+    return None
+
+
 def crawl(website: str, region: str | None, session: requests.Session, robots: Robots | None = None,
-          timeout: float = 8.0, max_pages: int = 6) -> SiteInfo:
+          timeout: float = 8.0, max_pages: int = 8) -> SiteInfo:
     info = SiteInfo()
     url = normalize_url(website)
     if not url:
         info.error = "invalid url"
         return info
-    pages = [url]
-    visited: set[str] = set()
-    guessed: set[str] = set()
-    expanded = False
-    while pages and len(visited) < max_pages:
-        page = pages.pop(0)
-        if page in visited or (page in guessed and info.emails):
-            continue
-        visited.add(page)
+    first = _first_page(url, session, robots, timeout, info)
+    if first is None:
+        return info
+    html, final = first
+    urls = [url, final]
+    _absorb(info, html, urls, region)
+    contacts = _contact_links(html, final, 3)
+    guesses = [g for g in (urljoin(final, p) for p in GUESS_PATHS) if g not in contacts]
+    tried = {final.rstrip("/"), url.rstrip("/")}
+    attempts = 1
+    for page in contacts + guesses:
+        if attempts >= max_pages:
+            break
+        if page.rstrip("/") in tried or (page in guesses and info.emails):
+            continue   # contact links are always read; blind guesses only while we still have no email
+        tried.add(page.rstrip("/"))
         if robots and not robots.allowed(page):
-            if not expanded:
-                info.reachable = True   # can't verify politely; assume up
-                info.robots_blocked = True
             continue
+        attempts += 1
         try:
-            html, final, answered = _get(session, page, timeout)
-        except requests.RequestException as e:
-            if page == url and url.startswith("http://"):
-                pages.insert(0, "https://" + url[7:])   # retry on https
-            info.error = type(e).__name__
+            html, _, _ = _get(session, page, timeout)
+        except requests.RequestException:
             continue
-        if not expanded and answered:
-            info.reachable = True
-        if not html:
-            continue
-        info.error = ""
-        for e in extract_emails(html):
-            if e not in info.emails:
-                info.emails.append(e)
-        for e in extract_embedded_emails(html):
-            if e not in info.emails and same_site(e.split("@")[1], url):
-                info.emails.append(e)
-        for p in extract_phones(html, region):
-            if p not in info.phones:
-                info.phones.append(p)
-        for k, v in extract_socials(html).items():
-            info.socials.setdefault(k, v)
-        if not expanded:
-            expanded = True
-            pages += _contact_links(html, final, max_pages - 1)
-            for g in GUESS_PATHS:   # not every site links its contact page in a crawlable way
-                gu = urljoin(final, g)
-                if gu not in pages:
-                    pages.append(gu)
-                    guessed.add(gu)
+        if html:
+            _absorb(info, html, urls, region)
     return info
 
 
 def make_session() -> requests.Session:
     s = requests.Session()
-    s.headers.update({"User-Agent": UA, "Accept-Language": "en,*;q=0.5"})
+    s.headers.update(HEADERS)
     adapter = requests.adapters.HTTPAdapter(pool_connections=64, pool_maxsize=64, max_retries=0)
     s.mount("http://", adapter)
     s.mount("https://", adapter)

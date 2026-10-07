@@ -74,11 +74,17 @@ def same_site(domain: str, website: str) -> bool:
     return bool(h) and (domain == h or domain.endswith("." + h) or h.endswith("." + domain))
 
 
+def is_pec(domain: str) -> bool:
+    return bool(re.search(r"(^|\.)(pec|legalmail|postecert|arubapec|cert)\.", domain + ".")) or domain.endswith(
+        ("pec.it", "legalmail.it", "postecert.it", "arubapec.it"))
+
+
 def rank_emails(emails: list[str], website: str = "") -> list[str]:
     """Best first: same domain as the business website, then named mailboxes over role ones."""
-    def score(e: str) -> tuple[int, int]:
+    def score(e: str) -> tuple[int, int, int]:
         local, domain = e.split("@")
         return (0 if website and same_site(domain, website) else 1,
+                1 if is_pec(domain) else 0,      # certified-mail boxes are a poor target for cold email
                 1 if local in ROLE_LOCAL else 0)
     return sorted(dict.fromkeys(emails), key=score)
 

@@ -95,32 +95,6 @@ def test_export_roundtrip(tmp_path):
     assert ws["A2"].data_type == "s" and ws["C2"].value == "info@x.pk" and ws.max_column == 6 and ws["E2"].value == "Yes"
 
 
-def test_crawl_with_fake_session():
-    from leadscraper.enrich import crawl
-
-    pages = {
-        "http://shop.example.net": '<a href="/contact-us">Contact</a><a href="https://facebook.com/shop">f</a>',
-        "http://shop.example.net/contact-us": 'Mail us: <a href="mailto:hi@shop.example.net">x</a> Tel +44 20 7946 0958',
-    }
-
-    class Raw:
-        def __init__(self, b): self.b = b.encode()
-        def read(self, n, decode_content=True): return self.b
-
-    class Resp:
-        def __init__(self, url):
-            self.url, self.ok, self.encoding = url, url in pages, "utf-8"
-            self.headers = {"content-type": "text/html"}
-            self.raw = Raw(pages.get(url, ""))
-        def close(self): pass
-
-    class Sess:
-        def get(self, url, **kw): return Resp(url)
-
-    info = crawl("shop.example.net", "GB", Sess(), None)
-    assert info.emails == ["hi@shop.example.net"] and info.socials["facebook"].endswith("/shop")
-    assert any("7946" in p for p in info.phones)
-
 
 def test_cli_end_to_end(tmp_path, monkeypatch):
     from leadscraper import cli
@@ -222,25 +196,6 @@ def test_website_status_column_and_filters(tmp_path, monkeypatch):
     _, rows = _run_cli(tmp_path, monkeypatch, _fake_osm(9), "--website", "yes", "--include-seen")
     assert {r[4] for r in rows} == {"Yes"}
 
-
-def test_crawl_reports_reachable():
-    from leadscraper.enrich import crawl, is_social
-
-    class Resp:
-        def __init__(self, ok): self.ok, self.url, self.encoding, self.headers = ok, "http://a.com", "utf-8", {"content-type": "text/html"}; self.raw = type("R", (), {"read": lambda s, n, decode_content=True: b"<p>hi</p>"})()
-        def close(self): pass
-
-    class Up:
-        def get(self, url, **kw): return Resp(True)
-
-    class Down:
-        def get(self, url, **kw):
-            import requests
-            raise requests.ConnectionError()
-
-    assert crawl("a.com", "GB", Up(), None).reachable is True
-    assert crawl("a.com", "GB", Down(), None).reachable is False
-    assert is_social("https://www.facebook.com/x") and not is_social("https://mysite.com")
 
 
 # ---------- Google Maps streaming against a local mock of the Maps page ----------
@@ -370,25 +325,6 @@ def test_mailto_url_encoding_fixed():
     assert set(extract_emails('<a href="mailto:a@x.pk,b@x.pk?subject=Hi">x</a>')) == {"a@x.pk", "b@x.pk"}
 
 
-def test_embedded_json_ld_email_only_if_same_domain():
-    from leadscraper.enrich import extract_embedded_emails, crawl
-    html = ('<script type="application/ld+json">{"@type":"Dentist","email":"care@smile.pk"}</script>'
-            '<script>var s="support@elementor.com"; var u="owner\\u0040smile.pk";</script>')
-    assert set(extract_embedded_emails(html)) == {"care@smile.pk", "support@elementor.com", "owner@smile.pk"}
-
-    class Raw:
-        def read(self, n, decode_content=True): return html.encode()
-
-    class Resp:
-        ok, url, encoding, headers, raw = True, "http://smile.pk", "utf-8", {"content-type": "text/html"}, Raw()
-        def close(self): pass
-
-    class S:
-        def get(self, url, **kw): return Resp()
-
-    # visible text has no email; the third-party address in the script must NOT be trusted
-    assert set(crawl("smile.pk", "PK", S(), None).emails) == {"care@smile.pk", "owner@smile.pk"}
-
 
 def test_email_reasons(tmp_path):
     cases = {
@@ -415,3 +351,153 @@ def test_email_reasons(tmp_path):
     col = {ws.cell(r, 1).value: ws.cell(r, 3).value for r in range(2, ws.max_row + 1)}
     assert col["A"] == "No website - email not available" and col["G"] == "hi@g.pk"
     assert ws.cell(2, 3).hyperlink is None and ws.cell(8, 3).hyperlink is not None
+
+
+# ---------- crawler robustness (fake web) ----------
+
+class FakeWeb:
+    """requests.Session look-alike. pages: url -> (status, html) or an Exception to raise."""
+
+    def __init__(self, pages, ssl_fail=()):
+        self.pages, self.ssl_fail, self.calls = pages, set(ssl_fail), []
+
+    def get(self, url, verify=True, **kw):
+        self.calls.append(url)
+        if url.startswith("https://") and url in self.ssl_fail and verify:
+            import requests
+            raise requests.exceptions.SSLError("bad cert")
+        hit = self.pages.get(url)
+        if isinstance(hit, Exception):
+            raise hit
+        status, body = hit if hit else (404, "")
+
+        class Raw:
+            def read(self, n, decode_content=True): return body.encode()
+
+        r = type("Resp", (), {})()
+        r.ok, r.status_code, r.url, r.encoding, r.raw = status < 400, status, url, "utf-8", Raw()
+        r.headers = {"content-type": "text/html"}
+        r.close = lambda: None
+        return r
+
+
+def test_crawl_follows_italian_contact_page_and_reads_footer():
+    from leadscraper.enrich import crawl
+    web = FakeWeb({
+        "http://centro.it": (200, '<a href="/contatti">Contatti</a><p>P.IVA 123</p>'),
+        "http://centro.it/contatti": (200, "Scrivici: info chiocciola centro punto it"),
+    })
+    # the obfuscation words need brackets to be trusted; plain text "chiocciola" must not match
+    assert crawl("centro.it", "IT", web, None).emails == []
+    web.pages["http://centro.it/contatti"] = (200, "Scrivici: info [chiocciola] centro [punto] it")
+    assert crawl("centro.it", "IT", web, None).emails == ["info@centro.it"]
+
+
+def test_crawl_guesses_contact_page_when_not_linked():
+    from leadscraper.enrich import crawl
+    web = FakeWeb({"http://x.it": (200, "<p>Benvenuti</p>"),
+                   "http://x.it/contatti": (200, '<a href="mailto:ciao@x.it">scrivici</a>')})
+    assert crawl("x.it", "IT", web, None).emails == ["ciao@x.it"]
+
+
+def test_403_is_blocked_not_down_and_twin_urls_are_tried():
+    from leadscraper.enrich import crawl
+    web = FakeWeb({"http://bot.it": (403, "denied"), "https://bot.it": (403, "denied"),
+                   "http://www.bot.it": (403, "denied"), "https://www.bot.it": (403, "denied")})
+    info = crawl("bot.it", "IT", web, None)
+    assert info.reachable is True and info.fetched is False and info.status == 403
+    assert len(web.calls) == 4          # http, http+www, https, https+www
+
+
+def test_dead_site_is_down_and_http_fallback_works():
+    import requests
+    from leadscraper.enrich import crawl
+    web = FakeWeb({"http://dead.it": requests.ConnectionError(), "https://dead.it": requests.ConnectionError(),
+                   "http://www.dead.it": requests.ConnectionError(), "https://www.dead.it": requests.ConnectionError()})
+    info = crawl("dead.it", "IT", web, None)
+    assert info.reachable is False and info.fetched is False
+    # https-only broken cert + http missing: the SSL fallback (verify=False) must still read the page
+    web = FakeWeb({"https://old.it": (200, '<a href="mailto:a@old.it">m</a>'), "http://old.it": requests.ConnectionError()},
+                  ssl_fail={"https://old.it"})
+    assert crawl("https://old.it", "IT", web, None).emails == ["a@old.it"]
+
+
+def test_www_variant_rescues_site():
+    import requests
+    from leadscraper.enrich import crawl
+    web = FakeWeb({"http://s.it": requests.ConnectionError(), "http://www.s.it": (200, "mailto:ok@s.it ok@s.it")})
+    assert crawl("s.it", "IT", web, None).emails == ["ok@s.it"]
+
+
+def test_embedded_json_ld_email_only_if_same_domain():
+    from leadscraper.enrich import crawl, extract_embedded_emails
+    html = ('<script type="application/ld+json">{"@type":"Dentist","email":"care@smile.pk"}</script>'
+            '<script>var s="support@elementor.com"; var u="owner\\u0040smile.pk";</script>')
+    assert set(extract_embedded_emails(html)) == {"care@smile.pk", "support@elementor.com", "owner@smile.pk"}
+    web = FakeWeb({"http://smile.pk": (200, html)})
+    assert set(crawl("smile.pk", "PK", web, None).emails) == {"care@smile.pk", "owner@smile.pk"}
+
+
+def test_pec_addresses_rank_last():
+    from leadscraper.validate import rank_emails
+    assert rank_emails(["studio@pec.it", "info@gmail.com"], "")[0] == "info@gmail.com"
+    assert rank_emails(["info@studio.it", "studio@legalmail.it"], "studio.it")[0] == "info@studio.it"
+    assert rank_emails(["x@mypec.it"], "")[0] == "x@mypec.it"      # lone address is still kept
+
+
+# ---------- browser fallback for JavaScript-built sites (local server) ----------
+
+def test_browser_fallback_finds_js_built_email(monkeypatch):
+    import glob, threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    exe = glob.glob("/opt/pw-browsers/chromium-*/chrome-linux*/chrome")
+    try:
+        import playwright  # noqa: F401
+    except ImportError:
+        return
+    if not exe:
+        return
+    monkeypatch.setenv("LEADSCRAPER_BROWSER_PATH", exe[0])
+
+    def make_server(pages):
+        class H(BaseHTTPRequestHandler):
+            def log_message(self, *a): pass
+            def do_GET(self):
+                body = pages.get(self.path)
+                if body is None:
+                    self.send_response(404); self.end_headers(); return
+                self.send_response(200); self.send_header("Content-Type", "text/html"); self.end_headers()
+                self.wfile.write(body.encode())
+        srv = HTTPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        return srv
+
+    js_srv = make_server({
+        "/": '<html><body><a href="/contatti">Contatti</a><div id="app">loading</div></body></html>',
+        "/contatti": ('<html><body><div id="c"></div><script>setTimeout(function(){document.getElementById("c")'
+                      '.innerHTML=\'<a href="mailto:ciao@demo.it">Scrivici</a>\'},300)</script></body></html>')})
+    flat_srv = make_server({"/": "<html><body><p>nothing here</p></body></html>"})
+    srv = js_srv
+    base = "http://127.0.0.1:%d" % js_srv.server_port
+    flat = "http://127.0.0.1:%d" % flat_srv.server_port
+    from leadscraper import enrich, pipeline, render
+    for mod in (enrich, render):                       # allow the loopback address in this test only
+        monkeypatch.setattr(mod, "normalize_url", lambda u: u if u.startswith("http") else "http://" + u)
+    a, b = Lead("JS Salon", website=base + "/"), Lead("Flat Salon", website=flat + "/")
+    try:
+        pipeline.enrich_all([a, b], "IT", check_dns=False, log=lambda m: None)
+        # same call, but from a worker thread beside a running event loop (how the Maps scraper calls it)
+        import asyncio
+        threaded = Lead("Threaded", website=base + "/")
+
+        async def from_loop():
+            await asyncio.to_thread(pipeline.enrich_all, [threaded], "IT", 24, 8.0, False, lambda m: None)
+        asyncio.run(from_loop())
+        plain_only = Lead("Plain", website=base + "/")
+        pipeline.enrich_all([plain_only], "IT", check_dns=False, log=lambda m: None, render=False)
+    finally:
+        js_srv.shutdown()
+        flat_srv.shutdown()
+    assert plain_only.email == "" and "Not found" in plain_only.email_note   # plain fetch cannot see JS content
+    assert a.email == "ciao@demo.it" and threaded.email == "ciao@demo.it"   # the browser fallback can
+    assert b.email == "" and b.email_note == "Not found on website" and b.site_state == "ok"
