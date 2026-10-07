@@ -136,7 +136,7 @@ def test_cli_end_to_end(tmp_path, monkeypatch):
                    "--source", "osm", "--no-website-crawl", "--no-dns-check"])
     assert rc == 0
     ws = openpyxl.load_workbook(out)["Leads"]
-    assert ws["A2"].value == "Smile Clinic" and ws["C2"].value == "+92 42 35761234" and ws["C3"].value is None
+    assert ws["A2"].value == "Smile Clinic" and ws["B2"].value == "+92 42 35761234" and ws["C2"].value == "info@smile.pk" and ws["C3"].value is None
 
 
 def test_social_sites_not_crawled_and_region():
