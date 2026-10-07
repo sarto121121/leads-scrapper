@@ -6,12 +6,12 @@ import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urlparse
 
-from .enrich import Robots, crawl, make_session
+from .enrich import Robots, crawl, is_social, make_session
 from .models import Lead
 from .validate import best_phone, verify_emails
 
 
-def _key(l: Lead) -> str:
+def lead_key(l: Lead) -> str:
     host = (urlparse(l.website if "://" in l.website else "//" + l.website).hostname or "").removeprefix("www.")
     name = re.sub(r"[^\w]+", "", l.name.lower())
     return f"{host}|{name}" if host else f"{name}|{re.sub(r'[^0-9]', '', l.raw_phones[0])[-8:] if l.raw_phones else l.address.lower()}"
@@ -23,9 +23,9 @@ def merge(leads: list[Lead]) -> list[Lead]:
     by_name: dict[str, Lead] = {}
     for l in leads:
         nm = re.sub(r"[^\w]+", "", l.name.lower())
-        cur = out.get(_key(l)) or by_name.get(nm if _close(by_name.get(nm), l) else "")
+        cur = out.get(lead_key(l)) or by_name.get(nm if _close(by_name.get(nm), l) else "")
         if cur is None:
-            out[_key(l)] = l
+            out[lead_key(l)] = l
             by_name.setdefault(nm, l)
             continue
         cur.address = cur.address or l.address
@@ -57,7 +57,11 @@ def enrich_all(leads: list[Lead], region: str | None, workers: int = 24, timeout
     lock = threading.Lock()
 
     def work(l: Lead) -> None:
+        if is_social(l.website):
+            l.website_status = "Social page only"   # nothing to crawl on a Facebook/Instagram page
+            return
         info = crawl(l.website, region, session, robots, timeout)
+        l.website_status = "Yes" if info.reachable else "Yes (not loading)"
         l.raw_emails += [e for e in info.emails if e not in l.raw_emails]
         # phones from the website are only a fallback, listed after directory data
         l.raw_phones += [p for p in info.phones[:3] if p not in l.raw_phones]
@@ -82,6 +86,10 @@ def enrich_all(leads: list[Lead], region: str | None, workers: int = 24, timeout
 def finalize(leads: list[Lead], region: str | None, check_dns: bool = True) -> None:
     """Validate raw emails/phones into the final exported fields."""
     def one(l: Lead) -> None:
+        if not l.website:
+            l.website_status = "No"
+        elif not l.website_status:   # not crawled (--no-website-crawl)
+            l.website_status = "Social page only" if is_social(l.website) else "Yes"
         l.phone, l.phone_display, l.phone_type = best_phone(l.raw_phones, region)
         l.email, l.other_emails, l.email_status = verify_emails(l.raw_emails, l.website, check_dns)
     with ThreadPoolExecutor(max_workers=16) as ex:

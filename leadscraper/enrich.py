@@ -26,6 +26,8 @@ OBFUSCATED_DOT = re.compile(r"\s*[\[\(\{]\s*dot\s*[\]\)\}]\s*", re.I)
 MAX_BYTES = 1_500_000
 SKIP_HOSTS = {"facebook.com", "instagram.com", "linkedin.com", "twitter.com", "x.com", "tiktok.com",
               "youtube.com", "wa.me", "linktr.ee", "business.site", "g.page", "goo.gl", "maps.google.com"}
+SOCIAL_HOSTS = {"facebook.com", "instagram.com", "linkedin.com", "twitter.com", "x.com", "tiktok.com",
+                "youtube.com", "wa.me", "linktr.ee"}
 GUESS_PATHS = ("/contact", "/contact-us", "/contact.html", "/contactus", "/about", "/about-us")
 
 
@@ -35,6 +37,7 @@ class SiteInfo:
         self.phones: list[str] = []
         self.socials: dict[str, str] = {}
         self.error: str = ""
+        self.reachable: bool = False   # the site's home page answered
 
 
 class Robots:
@@ -85,6 +88,12 @@ def normalize_url(url: str) -> str:
     if host in SKIP_HOSTS or any(host.endswith("." + h) for h in SKIP_HOSTS):
         return ""   # social/redirect pages have no scrapable contact data
     return url
+
+
+def is_social(url: str) -> bool:
+    """True when the 'website' is really a social-media / link-in-bio page."""
+    host = (urlparse(url if "://" in url else "//" + url).hostname or "").lower().removeprefix("www.")
+    return any(host == h or host.endswith("." + h) for h in SOCIAL_HOSTS)
 
 
 def _decode_cf(enc: str) -> str:
@@ -163,15 +172,16 @@ def _contact_links(html: str, base: str, limit: int) -> list[str]:
     return out[:limit]
 
 
-def _get(session: requests.Session, url: str, timeout: float) -> tuple[str, str]:
+def _get(session: requests.Session, url: str, timeout: float) -> tuple[str, str, bool]:
+    """Return (html, final_url, answered). answered=True for any non-error HTTP response."""
     r = session.get(url, timeout=timeout, stream=True, allow_redirects=True)
     try:
         if not r.ok:
-            return "", r.url
+            return "", r.url, False
         if "html" not in r.headers.get("content-type", "html").lower():
-            return "", r.url
+            return "", r.url, True
         body = r.raw.read(MAX_BYTES, decode_content=True)
-        return body.decode(r.encoding or "utf-8", errors="replace"), r.url
+        return body.decode(r.encoding or "utf-8", errors="replace"), r.url, True
     finally:
         r.close()
 
@@ -186,20 +196,25 @@ def crawl(website: str, region: str | None, session: requests.Session, robots: R
     pages = [url]
     visited: set[str] = set()
     guessed: set[str] = set()
+    expanded = False
     while pages and len(visited) < max_pages:
         page = pages.pop(0)
         if page in visited or (page in guessed and info.emails):
             continue
         visited.add(page)
         if robots and not robots.allowed(page):
+            if not expanded:
+                info.reachable = True   # can't verify politely; assume up
             continue
         try:
-            html, final = _get(session, page, timeout)
+            html, final, answered = _get(session, page, timeout)
         except requests.RequestException as e:
             if page == url and url.startswith("http://"):
                 pages.insert(0, "https://" + url[7:])   # retry on https
             info.error = type(e).__name__
             continue
+        if not expanded and answered:
+            info.reachable = True
         if not html:
             continue
         info.error = ""
@@ -211,7 +226,8 @@ def crawl(website: str, region: str | None, session: requests.Session, robots: R
                 info.phones.append(p)
         for k, v in extract_socials(html).items():
             info.socials.setdefault(k, v)
-        if len(visited) == 1:
+        if not expanded:
+            expanded = True
             pages += _contact_links(html, final, max_pages - 1)
             for g in GUESS_PATHS:   # not every site links its contact page in a crawlable way
                 gu = urljoin(final, g)

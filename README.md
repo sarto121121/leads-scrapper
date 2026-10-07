@@ -10,7 +10,21 @@ python -m leadscraper -c "Pakistan" -t "Lahore" -k "dentist"
 python -m leadscraper -c Pakistan -t Lahore -k dentist --areas "DHA,Gulberg,Johar Town,Model Town"
 ```
 
-Output: `leads_<type>_<city>_<country>.xlsx` with columns **Name, Phone, Email, Address**.
+Output: `leads_<type>_<city>_<country>.xlsx` with columns **Name, Phone, Email, Address,
+Website Present, Website**. *Website Present* is `Yes`, `Yes (not loading)` (listed but the site did
+not answer), `Social page only` (just Facebook/Instagram/etc.) or `No`.
+
+### Exact number of leads
+```bash
+python -m leadscraper -c Pakistan -t Lahore -k dentist -n 50          # exactly 50 leads
+python -m leadscraper -c UK -t London -k "wedding venue" -n 100 --require-email
+python -m leadscraper -c Pakistan -t Lahore -k dentist -n 30 --website no   # businesses with no website
+```
+`-n` is per business type and counts only *complete* leads (a phone or an email; use
+`--keep-incomplete` to count everything). It keeps scrolling/searching until it has N, then stops.
+If fewer than N exist for your filters it saves what exists and tells you how to widen the search
+(`--areas`, a bigger city, relaxing `--require-*` / `--website`).
+
 Google Maps shows about 120 results per search; use `--areas` to search neighbourhood by
 neighbourhood and get many more. Add `--show-browser` to watch it work or solve a captcha.
 

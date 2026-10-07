@@ -17,6 +17,7 @@ class Lead:
     other_emails: list[str] = field(default_factory=list)
     email_status: str = ""
     website: str = ""
+    website_status: str = ""     # Yes / Yes (not loading) / Social page only / No
     socials: dict[str, str] = field(default_factory=dict)
     lat: float | None = None
     lon: float | None = None

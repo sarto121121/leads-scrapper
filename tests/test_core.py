@@ -92,7 +92,7 @@ def test_export_roundtrip(tmp_path):
     p = tmp_path / "o.xlsx"
     write_xlsx([l], str(p), {"City": "X"})
     ws = openpyxl.load_workbook(p)["Leads"]
-    assert ws["A2"].data_type == "s" and ws["C2"].value == "info@x.pk" and ws.max_column == 4
+    assert ws["A2"].data_type == "s" and ws["C2"].value == "info@x.pk" and ws.max_column == 6 and ws["E2"].value == "Yes"
 
 
 def test_crawl_with_fake_session():
@@ -174,3 +174,120 @@ def test_maps_extract_js_markup():
             return r
     r = asyncio.run(go())
     assert r["name"] == "Smile Hub" and r["address"] == "5 Mall Rd" and r["phone"] == "0320 4411688"
+
+
+# ---------- exact count / website status ----------
+
+def _fake_osm(n, with_contact=lambda i: True):
+    def fake_search(city, country, cat, log=print):
+        leads = [Lead(f"Biz {i}", cat, f"{i} Main St", city, country, lat=i, lon=i, source="OpenStreetMap",
+                      website=("https://facebook.com/biz%d" % i if i % 3 == 0 else "https://biz%d.com" % i if i % 3 == 1 else ""),
+                      raw_phones=(["+44 20 7946 %04d" % i] if with_contact(i) else []))
+                 for i in range(1, n + 1)]
+        return leads, osm.Place("x", "GB", country, "relation", 1, (0, 0, 1, 1))
+    return fake_search
+
+
+def _run_cli(tmp_path, monkeypatch, fake, *extra):
+    from leadscraper import cli
+    monkeypatch.setattr(cli.osm, "search", fake)
+    out = tmp_path / "o.xlsx"
+    rc = cli.main(["-c", "UK", "-t", "London", "-k", "x", "-o", str(out), "--source", "osm",
+                   "--no-website-crawl", "--no-dns-check", *extra])
+    rows = list(openpyxl.load_workbook(out)["Leads"].iter_rows(min_row=2, values_only=True)) if out.exists() else []
+    return rc, rows
+
+
+def test_exact_count_even_when_half_have_no_contact(tmp_path, monkeypatch):
+    # only even-numbered businesses have a phone; asking for 7 must give exactly 7 qualified leads
+    rc, rows = _run_cli(tmp_path, monkeypatch, _fake_osm(100, lambda i: i % 2 == 0), "-n", "7")
+    assert rc == 0 and len(rows) == 7 and all(r[1] for r in rows)
+
+
+def test_count_larger_than_available_returns_what_exists(tmp_path, monkeypatch):
+    rc, rows = _run_cli(tmp_path, monkeypatch, _fake_osm(5), "-n", "50")
+    assert rc == 0 and len(rows) == 5
+
+
+def test_website_status_column_and_filters(tmp_path, monkeypatch):
+    rc, rows = _run_cli(tmp_path, monkeypatch, _fake_osm(9))
+    status = {r[0]: r[4] for r in rows}
+    assert status["Biz 1"] == "Yes" and status["Biz 3"] == "Social page only" and status["Biz 2"] == "No"
+    _, rows = _run_cli(tmp_path, monkeypatch, _fake_osm(9), "--website", "no")
+    assert {r[4] for r in rows} == {"No", "Social page only"}
+    _, rows = _run_cli(tmp_path, monkeypatch, _fake_osm(9), "--website", "yes")
+    assert {r[4] for r in rows} == {"Yes"}
+
+
+def test_crawl_reports_reachable():
+    from leadscraper.enrich import crawl, is_social
+
+    class Resp:
+        def __init__(self, ok): self.ok, self.url, self.encoding, self.headers = ok, "http://a.com", "utf-8", {"content-type": "text/html"}; self.raw = type("R", (), {"read": lambda s, n, decode_content=True: b"<p>hi</p>"})()
+        def close(self): pass
+
+    class Up:
+        def get(self, url, **kw): return Resp(True)
+
+    class Down:
+        def get(self, url, **kw):
+            import requests
+            raise requests.ConnectionError()
+
+    assert crawl("a.com", "GB", Up(), None).reachable is True
+    assert crawl("a.com", "GB", Down(), None).reachable is False
+    assert is_social("https://www.facebook.com/x") and not is_social("https://mysite.com")
+
+
+# ---------- Google Maps streaming against a local mock of the Maps page ----------
+
+def test_maps_scrolls_and_stops_at_exact_count(tmp_path, monkeypatch):
+    import glob, threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    exe = glob.glob("/opt/pw-browsers/chromium-*/chrome-linux*/chrome")
+    try:
+        import playwright  # noqa: F401
+    except ImportError:
+        return
+    if not exe:
+        return
+    monkeypatch.setenv("LEADSCRAPER_BROWSER_PATH", exe[0])
+    TOTAL = 45
+    hits = []
+
+    class H(BaseHTTPRequestHandler):
+        def log_message(self, *a): pass
+        def do_GET(self):
+            if self.path.startswith("/maps/search/"):
+                body = """<html><body><h1>Results</h1>
+<div role="feed" id="f" style="height:300px;overflow:auto">%s</div>
+<script>
+let n = 20; const T = %d, f = document.getElementById('f');
+function add(a,b){ for(let i=a;i<b;i++){ const el=document.createElement('a'); el.href='/maps/place/Biz'+i+'/data=!1sID'+i; el.setAttribute('aria-label','Biz '+i); el.style.display='block'; el.style.height='60px'; el.textContent='Biz '+i; f.appendChild(el);} }
+f.addEventListener('scroll', () => { if (f.scrollTop + f.clientHeight >= f.scrollHeight - 5 && n < T) { setTimeout(() => { const m=Math.min(T,n+20); add(n,m); n=m; if(n>=T){const d=document.createElement('div'); d.textContent="You've reached the end of the list."; f.appendChild(d);} }, 200); } });
+</script></body></html>""" % ("".join('<a href="/maps/place/Biz%d/data=!1sID%d" aria-label="Biz %d" style="display:block;height:60px">Biz %d</a>' % (i, i, i, i) for i in range(20)), TOTAL)
+            elif self.path.startswith("/maps/place/"):
+                i = int(self.path.split("/")[3][3:])
+                hits.append(i)
+                phone = ('<button data-item-id="phone:tel:x" aria-label="Phone: 020 7946 %04d"></button>' % i) if i % 2 == 0 else ""
+                site = '<a data-item-id="authority" href="https://biz%d.com/"></a>' % i if i % 4 == 0 else ""
+                body = '<html><body><h1>Biz %d</h1><button data-item-id="address" aria-label="Address: %d High St"></button>%s%s</body></html>' % (i, i, phone, site)
+            else:
+                self.send_response(404); self.end_headers(); return
+            self.send_response(200); self.send_header("Content-Type", "text/html"); self.end_headers()
+            self.wfile.write(body.encode())
+
+    srv = HTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    from leadscraper import cli, maps
+    monkeypatch.setattr(maps, "SEARCH_URL", "http://127.0.0.1:%d/maps/search/{q}" % srv.server_port)
+    out = tmp_path / "m.xlsx"
+    try:
+        rc = cli.main(["-c", "UK", "-t", "London", "-k", "dentist", "-n", "15", "-o", str(out),
+                       "--no-website-crawl", "--no-dns-check"])
+    finally:
+        srv.shutdown()
+    rows = list(openpyxl.load_workbook(out)["Leads"].iter_rows(min_row=2, values_only=True))
+    assert rc == 0 and len(rows) == 15 and all(r[1] for r in rows)
+    assert len(set(hits)) < TOTAL          # stopped early instead of reading every place
+    assert max(hits) >= 25                 # had to scroll past the first 20 to find 15 with phones

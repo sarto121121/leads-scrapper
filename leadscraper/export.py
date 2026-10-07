@@ -9,11 +9,11 @@ from openpyxl.utils import get_column_letter
 
 from .models import Lead
 
-COLUMNS = [("Name", 38), ("Phone", 22), ("Email", 38), ("Address", 60)]
+COLUMNS = [("Name", 38), ("Phone", 22), ("Email", 38), ("Address", 60), ("Website Present", 18), ("Website", 40)]
 
 
 def _row(l: Lead) -> list:
-    return [l.name, l.phone_display, l.email, l.address]
+    return [l.name, l.phone_display, l.email, l.address, l.website_status or ('Yes' if l.website else 'No'), l.website]
 
 
 def safe_filename(*parts: str) -> str:
@@ -38,6 +38,10 @@ def write_xlsx(leads: list[Lead], path: str, meta: dict[str, str]) -> None:
         if c.value:
             c.hyperlink = "mailto:" + str(c.value)
             c.font = Font(color="0563C1", underline="single")
+        w = ws.cell(r, 6)
+        if w.value and str(w.value).startswith("http"):
+            w.hyperlink = str(w.value)
+            w.font = Font(color="0563C1", underline="single")
     ws.freeze_panes = "B2"
     ws.auto_filter.ref = ws.dimensions
 
@@ -48,6 +52,9 @@ def write_xlsx(leads: list[Lead], path: str, meta: dict[str, str]) -> None:
         ("Total leads", n),
         ("With email", sum(bool(l.email) for l in leads)),
         ("With phone", sum(bool(l.phone) for l in leads)),
+        ("With a website", sum(l.website_status.startswith("Yes") for l in leads)),
+        ("Social page only", sum(l.website_status == "Social page only" for l in leads)),
+        ("No website", sum(l.website_status == "No" for l in leads)),
         ("With email AND phone", sum(bool(l.email and l.phone) for l in leads)),
         ("Note", "Emails are only listed when found on the business's own listing/website and the "
                  "domain accepts mail. Phones are only listed when they are valid for their country."),
