@@ -115,7 +115,7 @@ async def _detail(ctx, url: str, sem: asyncio.Semaphore) -> dict | None:
 
 
 async def _run(queries: list[str], category: str, city: str, country: str, on_batch,
-               batch_size: int, headless: bool, concurrency: int, log) -> None:
+               batch_size: int, headless: bool, concurrency: int, log, skip_ids: frozenset[str] = frozenset()) -> None:
     try:
         from playwright.async_api import async_playwright
     except ImportError as e:
@@ -157,7 +157,7 @@ async def _run(queries: list[str], category: str, city: str, country: str, on_ba
                             ended = await _scroll_until(page, items, len(done_urls) + batch_size, log)
                         fresh = [(u, n) for u, n in items.items() if u not in done_urls]
                         # places already read under an earlier search count as handled
-                        done_urls.update(u for u, _ in fresh if _place_id(u) in seen_ids)
+                        done_urls.update(u for u, _ in fresh if _place_id(u) in seen_ids or _place_id(u) in skip_ids)
                         new = [(u, n) for u, n in fresh if u not in done_urls][:batch_size]
                         if not new:
                             if ended:
@@ -185,7 +185,7 @@ def _to_lead(d: dict, url: str, listed_name: str, category: str, city: str, coun
     if not name:
         return None
     lead = Lead(name=name, category=category, address=d["address"], city=city, country=country,
-                website=d["website"], source="Google Maps", map_url=url)
+                website=d["website"], source="Google Maps", map_url=url, place_id=_place_id(url))
     if d["phone"]:
         lead.raw_phones.append(d["phone"])
     m = re.search(r"!3d(-?\d+\.\d+)!4d(-?\d+\.\d+)", url)
@@ -201,7 +201,7 @@ def _place_id(url: str) -> str:
 
 def search(city: str, country: str, category: str, on_batch, areas: list[str] | None = None,
            more_queries: bool = False, batch_size: int = 20, headless: bool = True,
-           concurrency: int = 4, log=print) -> None:
+           concurrency: int = 4, log=print, skip_ids: frozenset[str] = frozenset()) -> None:
     """Stream results to on_batch(list[Lead]) -> bool. Stop as soon as it returns True.
 
     more_queries adds a few differently-worded searches to dig deeper when a target count is not met.
@@ -211,4 +211,4 @@ def search(city: str, country: str, category: str, on_batch, areas: list[str] | 
     if more_queries:
         base += [f"best {category} in {city}, {country}", f"{category} near {city}, {country}",
                  f"{category} {city} {country} contact"]
-    asyncio.run(_run(base, category, city, country, on_batch, batch_size, headless, concurrency, log))
+    asyncio.run(_run(base, category, city, country, on_batch, batch_size, headless, concurrency, log, skip_ids))

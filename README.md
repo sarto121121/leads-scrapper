@@ -28,6 +28,15 @@ If fewer than N exist for your filters it saves what exists and tells you how to
 Google Maps shows about 120 results per search; use `--areas` to search neighbourhood by
 neighbourhood and get many more. Add `--show-browser` to watch it work or solve a captcha.
 
+### No repeated leads
+Every run searches live, and the tool remembers what it already exported (file
+`~/.leadscraper/history.json`, i.e. `C:\Users\<you>\.leadscraper\history.json` on Windows).
+Run it again for the same city/type and you only get **new** leads; with `-n 50` you get 50 *new* ones.
+A lead counts as already seen if its Google listing, phone, email, or name+website matches.
+`--include-seen` ignores the history, `--reset-history` wipes it, `--history FILE` uses another file
+(e.g. one per client). Leads are recorded only after the Excel file is saved successfully.
+When every match has been exported already, use `--areas` or another city/type.
+
 ## How it works
 1. **Find businesses** – default: Google Maps in a real browser (scrolls the whole list, opens every place; no key). Other sources: `--source api` (official Google Places API), `osm`, `all`. OpenStreetMap (Nominatim + Overpass), free, worldwide, no key.
    Optional: set `GOOGLE_MAPS_API_KEY` to also pull Google Places (usually better phone/website

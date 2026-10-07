@@ -192,6 +192,7 @@ def _run_cli(tmp_path, monkeypatch, fake, *extra):
     from leadscraper import cli
     monkeypatch.setattr(cli.osm, "search", fake)
     out = tmp_path / "o.xlsx"
+    out.unlink(missing_ok=True)   # so a run that writes nothing is not mistaken for the previous file
     rc = cli.main(["-c", "UK", "-t", "London", "-k", "x", "-o", str(out), "--source", "osm",
                    "--no-website-crawl", "--no-dns-check", *extra])
     rows = list(openpyxl.load_workbook(out)["Leads"].iter_rows(min_row=2, values_only=True)) if out.exists() else []
@@ -216,9 +217,9 @@ def test_website_status_column_and_filters(tmp_path, monkeypatch):
     assert status["Biz 1"] == "Yes" and link["Biz 1"] == "https://biz1.com"
     assert status["Biz 3"] == "No" and link["Biz 3"] is None      # Facebook page is not a website
     assert status["Biz 2"] == "No"
-    _, rows = _run_cli(tmp_path, monkeypatch, _fake_osm(9), "--website", "no")
+    _, rows = _run_cli(tmp_path, monkeypatch, _fake_osm(9), "--website", "no", "--include-seen")
     assert {r[4] for r in rows} == {"No"}
-    _, rows = _run_cli(tmp_path, monkeypatch, _fake_osm(9), "--website", "yes")
+    _, rows = _run_cli(tmp_path, monkeypatch, _fake_osm(9), "--website", "yes", "--include-seen")
     assert {r[4] for r in rows} == {"Yes"}
 
 
@@ -288,9 +289,20 @@ f.addEventListener('scroll', () => { if (f.scrollTop + f.clientHeight >= f.scrol
     try:
         rc = cli.main(["-c", "UK", "-t", "London", "-k", "dentist", "-n", "15", "-o", str(out),
                        "--no-website-crawl", "--no-dns-check"])
+        first = list(openpyxl.load_workbook(out)["Leads"].iter_rows(min_row=2, values_only=True))
+        reads_before = len(hits)
+        out2 = tmp_path / "m2.xlsx"
+        rc2 = cli.main(["-c", "UK", "-t", "London", "-k", "dentist", "-n", "5", "-o", str(out2),
+                        "--no-website-crawl", "--no-dns-check"])
+        second = list(openpyxl.load_workbook(out2)["Leads"].iter_rows(min_row=2, values_only=True))
+        second_reads = hits[reads_before:]
     finally:
         srv.shutdown()
-    rows = list(openpyxl.load_workbook(out)["Leads"].iter_rows(min_row=2, values_only=True))
+    rows = first
+    # second run: 5 brand-new leads, none repeated, and exported places were not even opened again
+    assert rc2 == 0 and len(second) == 5 and not ({r[0] for r in rows} & {r[0] for r in second})
+    exported_ids = {int(r[0].split()[1]) for r in rows}
+    assert not (exported_ids & set(second_reads))
     assert rc == 0 and len(rows) == 15 and all(r[1] for r in rows)
     assert len(set(hits)) < TOTAL          # stopped early instead of reading every place
     assert max(hits) >= 25                 # had to scroll past the first 20 to find 15 with phones
@@ -303,3 +315,48 @@ def test_clean_website_drops_social_and_adds_scheme():
         l = Lead("x", website=url)
         clean_website(l)
         assert l.website == want, url
+
+
+# ---------- history: no repeats across runs ----------
+
+def _two_runs(tmp_path, monkeypatch, n, *extra):
+    r1 = _run_cli(tmp_path, monkeypatch, _fake_osm(30), "-n", str(n))[1]
+    r2 = _run_cli(tmp_path, monkeypatch, _fake_osm(30), "-n", str(n), *extra)[1]
+    return {r[0] for r in r1}, {r[0] for r in r2}
+
+
+def test_second_run_returns_only_new_leads(tmp_path, monkeypatch):
+    a, b = _two_runs(tmp_path, monkeypatch, 10)
+    assert len(a) == 10 and len(b) == 10 and not (a & b)
+
+
+def test_runs_until_source_exhausted_then_reports_no_new(tmp_path, monkeypatch):
+    _run_cli(tmp_path, monkeypatch, _fake_osm(12), "-n", "12")
+    rc, rows = _run_cli(tmp_path, monkeypatch, _fake_osm(12), "-n", "12")
+    assert rc == 1 and rows == []
+
+
+def test_include_seen_and_reset(tmp_path, monkeypatch):
+    a, b = _two_runs(tmp_path, monkeypatch, 5, "--include-seen")
+    assert a == b
+    _run_cli(tmp_path, monkeypatch, _fake_osm(30), "-n", "5")
+    _, c = _run_cli(tmp_path, monkeypatch, _fake_osm(30), "-n", "5", "--reset-history")
+    assert {r[0] for r in c} == a
+
+
+def test_same_phone_or_email_counts_as_same_lead(tmp_path, monkeypatch):
+    def fake(city, country, cat, log=print):
+        leads = [Lead("Clinic A", cat, lat=1, lon=1, raw_phones=["+44 20 7946 0001"]),
+                 Lead("Clinic A (listing 2)", cat, lat=9, lon=9, raw_phones=["+44 20 7946 0001"]),
+                 Lead("Other", cat, lat=5, lon=5, raw_emails=["hi@other.co.uk"])]
+        return leads, osm.Place("x", "GB", country, "relation", 1, (0, 0, 1, 1))
+    _, rows = _run_cli(tmp_path, monkeypatch, fake)
+    assert len(rows) == 2
+
+
+def test_history_file_survives_corruption(tmp_path):
+    from leadscraper.history import History
+    p = tmp_path / "h.json"
+    p.write_text("{not json")
+    h = History(p)
+    assert h.exported == 0 and (tmp_path / "h.broken").exists()

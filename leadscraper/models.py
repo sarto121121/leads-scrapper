@@ -23,6 +23,7 @@ class Lead:
     lon: float | None = None
     source: str = ""
     map_url: str = ""
+    place_id: str = ""           # stable listing id (used to avoid repeats across runs)
     # raw values collected before validation (not exported)
     raw_phones: list[str] = field(default_factory=list)
     raw_emails: list[str] = field(default_factory=list)
