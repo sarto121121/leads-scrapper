@@ -3,10 +3,11 @@ from __future__ import annotations
 import argparse
 import sys
 
-from . import osm, places
+from . import maps, osm, places
 from .export import safe_filename, write_xlsx
 from .models import Lead
 from .pipeline import enrich_all, finalize, merge
+from .validate import country_region
 
 
 def _log(msg: str) -> None:
@@ -22,8 +23,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("-k", "--category", help="Business type(s), comma separated: 'dentist,gym' "
                    "(or an OSM tag such as shop=bakery)")
     p.add_argument("-o", "--output", help="Output .xlsx path (default: auto-named)")
-    p.add_argument("--source", choices=["auto", "osm", "google"], default="auto",
-                   help="auto = OpenStreetMap, plus Google Places if GOOGLE_MAPS_API_KEY is set")
+    p.add_argument("--source", choices=["maps", "api", "osm", "all"], default="maps",
+                   help="maps = Google Maps via browser (default, no key); api = official Google Places "
+                        "API (needs GOOGLE_MAPS_API_KEY); osm = OpenStreetMap; all = everything")
+    p.add_argument("--areas", help="Comma-separated neighbourhoods to search one by one for MORE results, "
+                   "e.g. 'DHA,Gulberg,Johar Town' (Google shows ~120 results per search)")
+    p.add_argument("--show-browser", action="store_true", help="Show the browser window (to solve a captcha)")
+    p.add_argument("--region", help="Two-letter country code for phone parsing (auto-detected normally)")
     p.add_argument("--limit", type=int, default=0, help="Max leads per category (0 = no limit)")
     p.add_argument("--no-website-crawl", action="store_true", help="Skip visiting websites (faster, fewer emails)")
     p.add_argument("--no-dns-check", action="store_true", help="Skip email domain verification")
@@ -45,17 +51,26 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     a = parse_args(argv)
     categories = [c.strip() for c in a.category.split(",") if c.strip()]
-    use_osm = a.source in ("auto", "osm")
-    use_google = a.source == "google" or (a.source == "auto" and bool(places.api_key()))
-    if a.source == "google" and not places.api_key():
-        _log("GOOGLE_MAPS_API_KEY is not set.")
+    use_maps = a.source in ("maps", "all")
+    use_api = a.source in ("api", "all")
+    use_osm = a.source in ("osm", "all")
+    if use_api and not places.api_key():
+        _log("GOOGLE_MAPS_API_KEY is not set (needed for --source api).")
         return 2
+    areas = [x.strip() for x in (a.areas or "").split(",") if x.strip()]
 
     all_leads: list[Lead] = []
-    region = None
+    region = a.region or country_region(a.country)
     for cat in categories:
         _log(f"\n=== {cat} in {a.city}, {a.country} ===")
         found: list[Lead] = []
+        if use_maps:
+            try:
+                found += maps.search(a.city, a.country, cat, areas, a.limit, not a.show_browser, log=_log)
+            except maps.MapsError as e:
+                _log(f"Google Maps: {e}")
+                if not (use_api or use_osm):
+                    return 1
         if use_osm:
             try:
                 got, place = osm.search(a.city, a.country, cat, _log)
@@ -63,9 +78,7 @@ def main(argv: list[str] | None = None) -> int:
                 found += got
             except (ValueError, RuntimeError) as e:
                 _log(f"OpenStreetMap: {e}")
-                if not use_google:
-                    return 1
-        if use_google:
+        if use_api:
             found += places.search(a.city, a.country, cat, log=_log)
         found = merge(found)
         if a.limit:

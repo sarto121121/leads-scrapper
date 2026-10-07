@@ -129,3 +129,15 @@ def best_phone(raws: list[str], region: str | None) -> tuple[str, str, str]:
             if r:
                 return r
     return "", "", ""
+
+
+def country_region(country: str) -> str | None:
+    """'Pakistan' -> 'PK' (None if unknown; a 2-letter code is returned as is)."""
+    c = country.strip()
+    if len(c) == 2 and c.isalpha():
+        return c.upper()
+    try:
+        import pycountry
+        return pycountry.countries.lookup(c).alpha_2
+    except (ImportError, LookupError):
+        return None

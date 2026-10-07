@@ -24,6 +24,9 @@ EMAIL_FIND = re.compile(r"[A-Za-z0-9._%+\-]{1,64}@[A-Za-z0-9\-]+(?:\.[A-Za-z0-9\
 OBFUSCATED = re.compile(r"\s*[\[\(\{]\s*(?:at|@)\s*[\]\)\}]\s*", re.I)
 OBFUSCATED_DOT = re.compile(r"\s*[\[\(\{]\s*dot\s*[\]\)\}]\s*", re.I)
 MAX_BYTES = 1_500_000
+SKIP_HOSTS = {"facebook.com", "instagram.com", "linkedin.com", "twitter.com", "x.com", "tiktok.com",
+              "youtube.com", "wa.me", "linktr.ee", "business.site", "g.page", "goo.gl", "maps.google.com"}
+GUESS_PATHS = ("/contact", "/contact-us", "/contact.html", "/contactus", "/about", "/about-us")
 
 
 class SiteInfo:
@@ -78,6 +81,9 @@ def normalize_url(url: str) -> str:
     except ValueError:
         if p.hostname == "localhost" or "." not in p.hostname:
             return ""
+    host = p.hostname.lower().removeprefix("www.")
+    if host in SKIP_HOSTS or any(host.endswith("." + h) for h in SKIP_HOSTS):
+        return ""   # social/redirect pages have no scrapable contact data
     return url
 
 
@@ -171,7 +177,7 @@ def _get(session: requests.Session, url: str, timeout: float) -> tuple[str, str]
 
 
 def crawl(website: str, region: str | None, session: requests.Session, robots: Robots | None = None,
-          timeout: float = 8.0, max_pages: int = 4) -> SiteInfo:
+          timeout: float = 8.0, max_pages: int = 6) -> SiteInfo:
     info = SiteInfo()
     url = normalize_url(website)
     if not url:
@@ -179,9 +185,10 @@ def crawl(website: str, region: str | None, session: requests.Session, robots: R
         return info
     pages = [url]
     visited: set[str] = set()
+    guessed: set[str] = set()
     while pages and len(visited) < max_pages:
         page = pages.pop(0)
-        if page in visited:
+        if page in visited or (page in guessed and info.emails):
             continue
         visited.add(page)
         if robots and not robots.allowed(page):
@@ -206,6 +213,11 @@ def crawl(website: str, region: str | None, session: requests.Session, robots: R
             info.socials.setdefault(k, v)
         if len(visited) == 1:
             pages += _contact_links(html, final, max_pages - 1)
+            for g in GUESS_PATHS:   # not every site links its contact page in a crawlable way
+                gu = urljoin(final, g)
+                if gu not in pages:
+                    pages.append(gu)
+                    guessed.add(gu)
     return info
 
 

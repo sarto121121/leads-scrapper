@@ -5,15 +5,17 @@ name, phone, email, address and website (plus a "Website Present" Yes/No column)
 
 ```bash
 pip install -r requirements.txt
+python -m playwright install chromium        # one time: the browser used for Google Maps
 python -m leadscraper -c "Pakistan" -t "Lahore" -k "dentist"
-python -m leadscraper -c Germany -t Berlin -k "restaurant,cafe" --require-email
-python -m leadscraper            # no arguments = interactive prompts
+python -m leadscraper -c Pakistan -t Lahore -k dentist --areas "DHA,Gulberg,Johar Town,Model Town"
 ```
 
-Output: `leads_<type>_<city>_<country>.xlsx` (sheet **Leads**, sheet **Summary** with counts).
+Output: `leads_<type>_<city>_<country>.xlsx` with columns **Name, Phone, Email, Address**.
+Google Maps shows about 120 results per search; use `--areas` to search neighbourhood by
+neighbourhood and get many more. Add `--show-browser` to watch it work or solve a captcha.
 
 ## How it works
-1. **Find businesses** – OpenStreetMap (Nominatim + Overpass), free, worldwide, no key.
+1. **Find businesses** – default: Google Maps in a real browser (scrolls the whole list, opens every place; no key). Other sources: `--source api` (official Google Places API), `osm`, `all`. OpenStreetMap (Nominatim + Overpass), free, worldwide, no key.
    Optional: set `GOOGLE_MAPS_API_KEY` to also pull Google Places (usually better phone/website
    coverage; max ~60 results per search, billed by Google).
 2. **Visit each business website** (home + contact/about pages, robots.txt respected) and extract

@@ -92,7 +92,7 @@ def test_export_roundtrip(tmp_path):
     p = tmp_path / "o.xlsx"
     write_xlsx([l], str(p), {"City": "X"})
     ws = openpyxl.load_workbook(p)["Leads"]
-    assert ws["A2"].data_type == "s" and ws["E2"].value == "info@x.pk" and ws["K2"].value == "Yes"
+    assert ws["A2"].data_type == "s" and ws["C2"].value == "info@x.pk" and ws.max_column == 4
 
 
 def test_crawl_with_fake_session():
@@ -133,7 +133,40 @@ def test_cli_end_to_end(tmp_path, monkeypatch):
     monkeypatch.setattr(cli.osm, "search", fake_search)
     out = tmp_path / "out.xlsx"
     rc = cli.main(["-c", "Pakistan", "-t", "Lahore", "-k", "dentist", "-o", str(out),
-                   "--no-website-crawl", "--no-dns-check"])
+                   "--source", "osm", "--no-website-crawl", "--no-dns-check"])
     assert rc == 0
     ws = openpyxl.load_workbook(out)["Leads"]
-    assert ws["A2"].value == "Smile Clinic" and ws["C2"].value == "+92 42 35761234" and ws["K3"].value == "No"
+    assert ws["A2"].value == "Smile Clinic" and ws["C2"].value == "+92 42 35761234" and ws["C3"].value is None
+
+
+def test_social_sites_not_crawled_and_region():
+    from leadscraper.validate import country_region
+    assert normalize_url("https://www.facebook.com/abc") == ""
+    assert country_region("Pakistan") == "PK" and country_region("de") == "DE"
+    assert country_region("Narnia") is None
+
+
+def test_maps_extract_js_markup():
+    import glob, asyncio
+    exe = glob.glob("/opt/pw-browsers/chromium-*/chrome-linux*/chrome")
+    try:
+        from playwright.async_api import async_playwright
+    except ImportError:
+        return
+    if not exe:
+        return
+    from leadscraper.maps import EXTRACT_JS
+    html = ('<h1>Results</h1><h1>Smile Hub</h1><button data-item-id="address" aria-label="Address: 5 Mall Rd">'
+            '</button><button data-item-id="phone:tel:0320" aria-label="Phone: 0320 4411688"></button>'
+            '<a data-item-id="authority" href="https://smilehub.pk/"></a>')
+
+    async def go():
+        async with async_playwright() as pw:
+            b = await pw.chromium.launch(executable_path=exe[0], args=["--no-sandbox"])
+            pg = await b.new_page()
+            await pg.set_content(html)
+            r = await pg.evaluate(EXTRACT_JS)
+            await b.close()
+            return r
+    r = asyncio.run(go())
+    assert r["name"] == "Smile Hub" and r["address"] == "5 Mall Rd" and r["phone"] == "0320 4411688"
