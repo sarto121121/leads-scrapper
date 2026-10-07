@@ -42,6 +42,10 @@ EXTRACT_JS = r"""() => {
 }"""
 
 
+CAPTCHA_MSG = ("Google is asking for a captcha (too many requests). Wait a while, or run with "
+               "--show-browser and solve it, or use --source api.")
+
+
 class MapsError(RuntimeError):
     pass
 
@@ -64,15 +68,17 @@ async def _open_search(page, url: str) -> str:
     await page.goto(url, wait_until="domcontentloaded", timeout=45000)
     await _accept_consent(page)
     if "/sorry/" in page.url:
-        raise MapsError("Google is asking for a captcha (too many requests). Wait a while, or run with "
-                        "--show-browser and solve it, or use --source api.")
+        raise MapsError(CAPTCHA_MSG)
     try:
-        await page.wait_for_selector('div[role="feed"], h1', timeout=20000)
+        # either the results list appears, or Maps jumped straight to the single matching place
+        await page.wait_for_function(
+            "() => !!document.querySelector('div[role=\"feed\"]') || location.href.includes('/maps/place/')",
+            timeout=20000)
     except Exception:
+        if "/sorry/" in page.url:
+            raise MapsError(CAPTCHA_MSG)
         return "none"
-    if await page.locator('div[role="feed"]').count():
-        return "feed"
-    return "single" if "/maps/place/" in page.url else "none"
+    return "feed" if await page.locator('div[role="feed"]').count() else "single"
 
 
 async def _scroll_until(page, items: dict[str, str], target: int, log) -> bool:
@@ -80,6 +86,8 @@ async def _scroll_until(page, items: dict[str, str], target: int, log) -> bool:
     feed = page.locator('div[role="feed"]')
     stale = 0
     for _ in range(500):
+        if "/sorry/" in page.url:
+            raise MapsError(CAPTCHA_MSG)
         links = await page.eval_on_selector_all(
             'div[role="feed"] a[href*="/maps/place/"]',
             "els => els.map(e => [e.href, e.getAttribute('aria-label') || ''])")
@@ -91,29 +99,41 @@ async def _scroll_until(page, items: dict[str, str], target: int, log) -> bool:
         if await page.get_by_text(END_TEXT).count():
             return True
         stale = stale + 1 if len(items) == before else 0
-        if stale >= 6:
+        if stale >= (6 if items else 15):    # a feed that is still empty gets longer to render
             return True
         await feed.evaluate("el => el.scrollTo(0, el.scrollHeight)")
         await page.wait_for_timeout(1200)
     return True
 
 
-async def _detail(ctx, url: str, sem: asyncio.Semaphore) -> dict | None:
+async def _detail(ctx, url: str, sem: asyncio.Semaphore, attempts: int = 2) -> dict | None:
+    """Read one place. Retries once; raises MapsError on a captcha; None when it could not be read."""
     async with sem:
-        page = await ctx.new_page()
-        try:
-            await page.goto(url, wait_until="domcontentloaded", timeout=40000)
-            await page.wait_for_selector("h1", timeout=15000)
-            try:  # action buttons render a moment after the title
-                await page.wait_for_selector('button[data-item-id="address"], button[data-item-id^="phone"]',
-                                             timeout=4000)
+        for n in range(attempts):
+            page = await ctx.new_page()
+            try:
+                resp = await page.goto(url, wait_until="domcontentloaded", timeout=40000)
+                if "/sorry/" in page.url or (resp is not None and resp.status == 429):
+                    raise MapsError(CAPTCHA_MSG)
+                if resp is not None and resp.status >= 400:
+                    raise RuntimeError(f"HTTP {resp.status}")      # an error page is not a business: retry
+                await page.wait_for_selector("h1", timeout=15000)
+                try:  # action buttons render a moment after the title
+                    await page.wait_for_selector('button[data-item-id="address"], button[data-item-id^="phone"]',
+                                                 timeout=4000)
+                except Exception:
+                    pass
+                return await page.evaluate(EXTRACT_JS)
+            except MapsError:
+                raise
             except Exception:
-                pass
-            return await page.evaluate(EXTRACT_JS)
-        except Exception:
-            return None
-        finally:
-            await page.close()
+                await asyncio.sleep(1.5 * (n + 1))
+            finally:
+                await page.close()
+        return None
+
+
+_COORDS = re.compile(r"!3d(-?\d+\.\d+)!4d(-?\d+\.\d+)")
 
 
 def ring_points(lat: float, lon: float, radius_km: float, step_km: float = 5.0) -> list[tuple[float, float]]:
@@ -139,7 +159,7 @@ async def _run(queries: list[str], category: str, city: str, country: str, on_ba
         raise MapsError("Playwright is not installed. Run:  pip install playwright  and then  "
                         "python -m playwright install chromium") from e
     seen_ids: set[str] = set()
-    coords: list[tuple[float, float]] = []
+    coords: dict[str, tuple[float, float]] = {}     # place id -> (lat, lon), from every place listed
     async with async_playwright() as pw:
         try:
             browser = await pw.chromium.launch(**launch_kwargs(headless))
@@ -161,7 +181,15 @@ async def _run(queries: list[str], category: str, city: str, country: str, on_ba
             log(f"Google Maps search: {label}")
             page = await ctx.new_page()
             try:
-                mode = await _open_search(page, url)
+                try:
+                    mode = await _open_search(page, url)
+                except MapsError:
+                    raise
+                except Exception as e:      # navigation timeout / network blip: skip this search, keep going
+                    log(f"  search skipped ({type(e).__name__}); continuing")
+                    return False
+                if mode == "none":
+                    log("  no results list appeared for this search")
                 items: dict[str, str] = {}
                 done_urls: set[str] = set()
                 ended = mode != "feed"
@@ -170,6 +198,10 @@ async def _run(queries: list[str], category: str, city: str, country: str, on_ba
                 while mode != "none":
                     if not ended:
                         ended = await _scroll_until(page, items, len(done_urls) + batch_size, log)
+                    for u in items:
+                        m = _COORDS.search(u)
+                        if m:
+                            coords.setdefault(_place_id(u), (float(m.group(1)), float(m.group(2))))
                     fresh = [(u, n) for u, n in items.items() if u not in done_urls]
                     # places already read under an earlier search count as handled
                     done_urls.update(u for u, _ in fresh if _place_id(u) in seen_ids or _place_id(u) in skip_ids)
@@ -179,14 +211,23 @@ async def _run(queries: list[str], category: str, city: str, country: str, on_ba
                             break
                         continue
                     done_urls.update(u for u, _ in new)
-                    seen_ids.update(_place_id(u) for u, _ in new)
                     log(f"  reading {len(new)} places ({len(done_urls)} listed so far) ...")
                     sem = asyncio.Semaphore(concurrency)
-                    details = await asyncio.gather(*[_detail(ctx, u, sem) for u, _ in new])
+                    details = await asyncio.gather(*[_detail(ctx, u, sem) for u, _ in new],
+                                                   return_exceptions=True)
+                    for d in details:
+                        if isinstance(d, MapsError):
+                            raise d                      # captcha: stop cleanly, the caller keeps what it has
+                    details = [None if isinstance(d, BaseException) else d for d in details]
+                    # only places we actually read count as handled; the rest may be retried if listed again
+                    seen_ids.update(_place_id(u) for (u, _), d in zip(new, details) if d)
+                    unread = sum(d is None for d in details)
+                    if unread:
+                        log(f"  note: {unread} of {len(new)} places could not be read (slow page); "
+                            f"they are retried if they appear in another search")
                     batch = [_to_lead(d, u, n, category, city, country)
                              for (u, n), d in zip(new, details) if d and not d.get("closed")]
                     batch = [b for b in batch if b]
-                    coords.extend((b.lat, b.lon) for b in batch if b.lat is not None and b.lon is not None)
                     # enrichment is slow blocking work: keep it off the browser's event loop
                     if await asyncio.to_thread(on_batch, batch):
                         return True
@@ -200,13 +241,20 @@ async def _run(queries: list[str], category: str, city: str, country: str, on_ba
             while i < len(plan):
                 label, url = plan[i]
                 i += 1
-                if await run_one(label, url):
-                    return
+                try:
+                    if await run_one(label, url):
+                        return
+                except MapsError:
+                    raise
+                except Exception as e:      # one failing search (timeout, page crash) must not end the run
+                    log(f"  this search failed midway ({type(e).__name__}: {str(e)[:80]}); moving on")
                 if i == len(plan) and radius_km and not widened:
                     widened = True
-                    if len(coords) >= 3:    # centre of what we found = centre of the city
-                        lat = statistics.median(c[0] for c in coords)
-                        lon = statistics.median(c[1] for c in coords)
+                    if len(coords) < 3:
+                        log("  (cannot widen the search: too few located places to find the city centre)")
+                    else:                   # centre of what we found = centre of the city
+                        lat = statistics.median(c[0] for c in coords.values())
+                        lon = statistics.median(c[1] for c in coords.values())
                         pts = ring_points(lat, lon, radius_km)
                         log(f"City listings used up - widening the search ring by ring (up to {radius_km:g} km "
                             f"around the centre, {len(pts)} extra searches; stops as soon as you have enough).")

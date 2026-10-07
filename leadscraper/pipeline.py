@@ -4,6 +4,7 @@ from __future__ import annotations
 import re
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import TimeoutError as FuturesTimeout
 from urllib.parse import urlparse
 
 from .enrich import Robots, crawl, is_social, make_session
@@ -54,6 +55,8 @@ def _close(a: Lead | None, b: Lead) -> bool:
     """Same name counts as the same business only if their coordinates are within ~300 m (or unknown)."""
     if a is None:
         return False
+    if a.place_id and b.place_id and a.source == b.source:
+        return False    # two distinct listings from one source (e.g. two Maps places) are two businesses
     if None in (a.lat, a.lon, b.lat, b.lon):
         return False
     return abs(a.lat - b.lat) < 0.003 and abs(a.lon - b.lon) < 0.003
@@ -68,7 +71,11 @@ def enrich_all(leads: list[Lead], region: str | None, workers: int = 24, timeout
     lock = threading.Lock()
 
     def work(l: Lead) -> None:
-        info = crawl(l.website, region, session, robots, timeout)
+        try:
+            info = crawl(l.website, region, session, robots, timeout)
+        except Exception:
+            l.site_state = "down"
+            return
         l.site_state = ("ok" if info.fetched else "blocked" if info.robots_blocked or info.reachable
                         else "down")   # reachable but no HTML = the site answered with an error (403 ...)
         l.raw_emails += [e for e in info.emails if e not in l.raw_emails]
@@ -83,12 +90,19 @@ def enrich_all(leads: list[Lead], region: str | None, workers: int = 24, timeout
 
     if todo:
         log(f"Visiting {len(todo)} websites for emails/phones ...")
-        with ThreadPoolExecutor(max_workers=workers) as ex:
-            for f in as_completed([ex.submit(work, l) for l in todo]):
+        ex = ThreadPoolExecutor(max_workers=workers)
+        futures = [ex.submit(work, l) for l in todo]
+        try:
+            # every crawl has its own time budget; this is only a backstop so one stuck site cannot hang the run
+            for f in as_completed(futures, timeout=max(180, 20 * len(todo))):
                 try:
                     f.result()
                 except Exception as e:  # one broken site must never kill the run
                     log(f"  warning: {type(e).__name__}: {e}")
+        except FuturesTimeout:
+            log("  warning: some websites took too long and were skipped")
+        finally:
+            ex.shutdown(wait=False, cancel_futures=True)
     if render:
         # sites with no email yet (JavaScript-built pages, bot filters): read them like a visitor would
         render_missing([l for l in todo if not l.raw_emails], region, log=log)

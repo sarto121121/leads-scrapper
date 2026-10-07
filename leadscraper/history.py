@@ -9,6 +9,7 @@ from pathlib import Path
 
 from .models import Lead
 from .pipeline import lead_key
+from .validate import same_site
 
 
 def default_path() -> Path:
@@ -17,8 +18,13 @@ def default_path() -> Path:
 
 
 def identities(l: Lead) -> dict[str, str]:
-    """The things that identify a business: its listing id, phone, email and name/site key."""
-    return {"ids": l.place_id or l.map_url, "phones": l.phone, "emails": l.email, "keys": lead_key(l)}
+    """The things that identify a business: its listing id, phone, email and name/site key.
+
+    A phone only identifies a business that has no website of its own: separate businesses (a clinic
+    group, a shopping gallery) often share one switchboard number but have different sites.
+    """
+    return {"ids": l.place_id or l.map_url, "phones": "" if l.website else l.phone,
+            "emails": l.email, "keys": lead_key(l)}
 
 
 class History:
@@ -29,16 +35,44 @@ class History:
     def __init__(self, path: Path | None = None):
         self.path = path
         self.data: dict[str, set[str]] = {f: set() for f in self.FIELDS}
+        self.dirty = False
+        self._reset = False
         if path and path.exists():
             try:
-                raw = json.loads(path.read_text(encoding="utf-8"))
-                for f in self.FIELDS:
-                    self.data[f] = set(raw.get(f, []))
-            except (OSError, ValueError):
+                self._load(self._read(path))
+            except (OSError, ValueError, TypeError, AttributeError):
                 # a damaged file must not silently start a fresh history that overwrites it
-                backup = path.with_suffix(".broken")
+                backup = path.with_name(f"{path.stem}.broken-{datetime.now():%Y%m%d-%H%M%S}{path.suffix}")
                 path.replace(backup)
                 print(f"Warning: history file was unreadable; moved to {backup} and starting fresh.")
+
+    @staticmethod
+    def _read(path: Path) -> dict:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            raise ValueError("history is not an object")
+        for f in History.FIELDS:
+            v = raw.get(f, [])
+            if not isinstance(v, list) or not all(isinstance(x, str) for x in v):
+                raise ValueError(f"history field {f} is malformed")
+        return raw
+
+    def _load(self, raw: dict) -> None:
+        for f in self.FIELDS:
+            self.data[f] |= set(raw.get(f, []))
+        if "e_ids" not in raw and raw.get("emails"):
+            # file from an older version: it did not record which leads had an email. A lead whose website
+            # host matches the domain of a recorded email certainly had one, so re-derive those.
+            domains = {e.split("@", 1)[1] for e in raw["emails"] if "@" in e}
+            for k in raw.get("keys", []):
+                host = k.split("|", 1)[0]
+                if host and any(same_site(d, host) for d in domains):
+                    self.data["e_keys"].add(k)
+
+    def reset(self) -> None:
+        """Forget everything (takes effect on disk at the next save)."""
+        self.data = {f: set() for f in self.FIELDS}
+        self._reset = self.dirty = True
 
     @property
     def exported(self) -> int:
@@ -64,14 +98,22 @@ class History:
                     self.data[f].add(v)
                     if l.email and f != "emails":
                         self.data["e_" + f].add(v)
+        if leads:
+            self.dirty = True
 
     def save(self) -> None:
         if not self.path:
             return
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        if not self._reset and self.path.exists():     # another run may have saved meanwhile: merge, don't clobber
+            try:
+                self._load(self._read(self.path))
+            except (OSError, ValueError, TypeError, AttributeError):
+                pass
         payload = {f: sorted(self.data[f]) for f in self.FIELDS}
         payload["updated"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
         fd, tmp = tempfile.mkstemp(dir=self.path.parent, suffix=".tmp")
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             json.dump(payload, fh)
         os.replace(tmp, self.path)   # atomic: never leaves a half-written history
+        self.dirty = self._reset = False

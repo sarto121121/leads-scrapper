@@ -18,55 +18,54 @@ SITE_BUDGET_S = 90
 MAX_PAGES = 5
 
 
-async def _render_one(ctx, url: str, region: str | None, sem: asyncio.Semaphore) -> SiteInfo:
-    info = SiteInfo()
-    async with sem:
-        page = await ctx.new_page()
-        try:
-            html, final = "", url
-            for cand in _candidates(url):          # http/https and www twins
+async def _render_one(ctx, url: str, region: str | None, info: SiteInfo) -> SiteInfo:
+    """Fill `info` in place, so whatever was found survives if the time budget runs out midway."""
+    page = await ctx.new_page()
+    try:
+        html, final = "", url
+        for cand in _candidates(url):          # http/https and www twins
+            try:
+                resp = await page.goto(cand, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT_MS)
+            except Exception as e:
+                info.error = type(e).__name__
+                continue
+            if resp is not None:
+                info.reachable, info.status = True, resp.status
+            if resp is not None and resp.status < 400:
                 try:
-                    resp = await page.goto(cand, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT_MS)
-                except Exception as e:
-                    info.error = type(e).__name__
-                    continue
-                if resp is not None:
-                    info.reachable, info.status = True, resp.status
-                if resp is not None and resp.status < 400:
-                    try:
-                        await page.wait_for_load_state("networkidle", timeout=6000)  # let scripts build the page
-                    except Exception:
-                        pass
-                    html, final = await page.content(), page.url
-                    info.fetched = True
-                    break
-            if not html:
-                return info
-            urls = [url, final]
-            _absorb(info, html, urls, region)
-            contacts = _contact_links(html, final, 3)
-            guesses = [g for g in (urljoin(final, p) for p in GUESS_PATHS[:4]) if g not in contacts]
-            tried = {final.rstrip("/"), url.rstrip("/")}
-            for nxt in contacts + guesses:
-                if len(tried) >= MAX_PAGES or (info.emails and nxt in guesses):
-                    break
-                if nxt.rstrip("/") in tried:
-                    continue
-                tried.add(nxt.rstrip("/"))
-                try:
-                    resp = await page.goto(nxt, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT_MS)
-                    if resp is None or resp.status >= 400:
-                        continue
-                    try:
-                        await page.wait_for_load_state("networkidle", timeout=5000)
-                    except Exception:
-                        pass
-                    _absorb(info, await page.content(), urls, region)
+                    await page.wait_for_load_state("networkidle", timeout=6000)  # let scripts build the page
                 except Exception:
-                    continue
+                    pass
+                html, final = await page.content(), page.url
+                info.fetched = True
+                break
+        if not html:
             return info
-        finally:
-            await page.close()
+        urls = [url, final]
+        _absorb(info, html, urls, region)
+        contacts = _contact_links(html, final, 3)
+        guesses = [g for g in (urljoin(final, p) for p in GUESS_PATHS[:4]) if g not in contacts]
+        tried = {final.rstrip("/"), url.rstrip("/")}
+        for nxt in contacts + guesses:
+            if len(tried) >= MAX_PAGES or (info.emails and nxt in guesses):
+                break
+            if nxt.rstrip("/") in tried:
+                continue
+            tried.add(nxt.rstrip("/"))
+            try:
+                resp = await page.goto(nxt, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT_MS)
+                if resp is None or resp.status >= 400:
+                    continue
+                try:
+                    await page.wait_for_load_state("networkidle", timeout=5000)
+                except Exception:
+                    pass
+                _absorb(info, await page.content(), urls, region)
+            except Exception:
+                continue
+        return info
+    finally:
+        await page.close()
 
 
 async def _run(urls: list[str], region: str | None, concurrency: int) -> list[SiteInfo | None]:
@@ -85,12 +84,22 @@ async def _run(urls: list[str], region: str | None, concurrency: int) -> list[Si
             await ctx.route("**/*", skip_heavy)
             sem = asyncio.Semaphore(concurrency)
 
+            timed_out = [0]
+
             async def one(u: str):
-                try:
-                    return await asyncio.wait_for(_render_one(ctx, u, region, sem), SITE_BUDGET_S)
-                except Exception:
-                    return None
-            return list(await asyncio.gather(*[one(u) for u in urls]))
+                info = SiteInfo()
+                async with sem:                       # queue time must not eat into a site's own budget
+                    try:
+                        await asyncio.wait_for(_render_one(ctx, u, region, info), SITE_BUDGET_S)
+                    except asyncio.TimeoutError:
+                        timed_out[0] += 1             # keep what was found before the clock ran out
+                    except Exception:
+                        pass
+                return info
+            res = list(await asyncio.gather(*[one(u) for u in urls]))
+            if timed_out[0]:
+                print(f"  note: {timed_out[0]} sites hit the {SITE_BUDGET_S}s browser limit (partial results kept)")
+            return res
         finally:
             await browser.close()
 

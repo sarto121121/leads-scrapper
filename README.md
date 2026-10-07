@@ -31,6 +31,17 @@ If fewer than N exist for your filters it saves what exists and tells you how to
 Google Maps shows about 120 results per search; use `--areas` to search neighbourhood by
 neighbourhood and get many more. Add `--show-browser` to watch it work or solve a captcha.
 
+### Results are never overwritten
+Each run saves to a new file (`leads_<type>_<city>_<country>_<date>_<time>.xlsx`); if you pass `-o`
+and the file exists, `_2`, `_3` ... is added. The full path is printed at the end. If a run is cut short
+(captcha, network error, Ctrl+C) the leads collected so far are still saved, and the message says the run
+STOPPED EARLY - re-run the same command later and it continues with new leads.
+
+### Getting more than one city's worth
+With `-n`, when the city's own listings run out the search widens ring by ring around the city centre
+(`--radius KM`, default 15; `--radius 0` = strictly inside the city). `--complete` keeps only leads that
+have email AND phone AND address.
+
 ### No repeated leads
 Every run searches live, and the tool remembers what it already exported (file
 `~/.leadscraper/history.json`, i.e. `C:\Users\<you>\.leadscraper\history.json` on Windows).

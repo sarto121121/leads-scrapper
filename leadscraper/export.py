@@ -4,6 +4,7 @@ import re
 from datetime import datetime
 
 from openpyxl import Workbook
+from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
@@ -35,7 +36,7 @@ def write_xlsx(leads: list[Lead], path: str, meta: dict[str, str]) -> None:
         ws.append([_clip(v) for v in _row(l)])
     for r in range(2, ws.max_row + 1):
         c = ws.cell(r, 3)
-        if c.value and "@" in str(c.value):
+        if c.value and leads[r - 2].email:
             c.hyperlink = "mailto:" + str(c.value)
             c.font = Font(color="0563C1", underline="single")
         elif c.value:   # a reason such as "Not found on website"
@@ -73,7 +74,7 @@ def write_xlsx(leads: list[Lead], path: str, meta: dict[str, str]) -> None:
 def _clip(v):
     """Excel cells hold at most 32767 chars; also neutralise formula injection from scraped text."""
     if isinstance(v, str):
-        v = v[:32000]
+        v = ILLEGAL_CHARACTERS_RE.sub("", v)[:32000]
         if v[:1] in ("=", "+", "-", "@") and not v.startswith("+"):
             v = " " + v
     return v

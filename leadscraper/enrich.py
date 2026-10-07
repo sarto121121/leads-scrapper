@@ -5,6 +5,7 @@ import html as htmllib
 import ipaddress
 import re
 import threading
+import time
 from urllib.parse import unquote, urljoin, urlparse
 from urllib.robotparser import RobotFileParser
 
@@ -29,11 +30,21 @@ EMAIL_FIND = re.compile(r"[A-Za-z0-9._%+\-]{1,64}@[A-Za-z0-9\-]+(?:\.[A-Za-z0-9\
 OBFUSCATED = re.compile(r"\s*[\[\(\{]\s*(?:at|@|chiocciola|arroba|ät)\s*[\]\)\}]\s*", re.I)
 OBFUSCATED_DOT = re.compile(r"\s*[\[\(\{]\s*(?:dot|punto|ponto|point)\s*[\]\)\}]\s*", re.I)
 MAX_BYTES = 1_500_000
+CRAWL_BUDGET_S = 45.0     # max time spent on one website's extra pages
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 SKIP_HOSTS = {"facebook.com", "instagram.com", "linkedin.com", "twitter.com", "x.com", "tiktok.com",
               "youtube.com", "wa.me", "linktr.ee", "business.site", "g.page", "goo.gl", "maps.google.com"}
 SOCIAL_HOSTS = {"facebook.com", "instagram.com", "linkedin.com", "twitter.com", "x.com", "tiktok.com",
-                "youtube.com", "wa.me", "linktr.ee"}
+                "youtube.com", "wa.me", "linktr.ee", "beacons.ai", "taplink.cc", "bio.site"}
+# Pages that are NOT the business's own website: booking platforms, directories, Google's own pages.
+# Their contact emails (support@, privacy@) belong to the platform, never to the business.
+PLATFORM_HOSTS = {"booksy.com", "treatwell.it", "treatwell.com", "treatwell.co.uk", "treatwell.de",
+                  "treatwell.es", "treatwell.fr", "fresha.com", "planity.com", "paginegialle.it",
+                  "paginebianche.it", "tripadvisor.com", "tripadvisor.it", "tripadvisor.co.uk", "yelp.com",
+                  "thefork.com", "thefork.it", "booking.com", "calendly.com", "setmore.com", "doctolib.it",
+                  "doctolib.fr", "doctolib.de", "miodottore.it", "pagesjaunes.fr", "gelbeseiten.de",
+                  "yell.com", "goo.gl", "g.page", "maps.app.goo.gl", "wa.me", "linktr.ee"}
+_GOOGLE_HOST = re.compile(r"(^|\.)google\.[a-z]{2,3}(\.[a-z]{2})?$")
 GUESS_PATHS = ("/contatti", "/contact", "/contacts", "/contact-us", "/contattaci", "/kontakt", "/contacto",
                "/contactez-nous", "/chi-siamo", "/about")
 
@@ -101,9 +112,10 @@ def normalize_url(url: str) -> str:
 
 
 def is_social(url: str) -> bool:
-    """True when the 'website' is really a social-media / link-in-bio page."""
+    """True when the 'website' is really a social-media, booking-platform or Google page (not the business's own)."""
     host = (urlparse(url if "://" in url else "//" + url).hostname or "").lower().removeprefix("www.")
-    return any(host == h or host.endswith("." + h) for h in SOCIAL_HOSTS)
+    return (any(host == h or host.endswith("." + h) for h in SOCIAL_HOSTS | PLATFORM_HOSTS)
+            or bool(_GOOGLE_HOST.search(host)))
 
 
 def _decode_cf(enc: str) -> str:
@@ -128,7 +140,7 @@ def extract_emails(html: str) -> list[str]:
         t.decompose()
     text = htmllib.unescape(soup.get_text(" "))
     text = OBFUSCATED_DOT.sub(".", OBFUSCATED.sub("@", text))
-    found += EMAIL_FIND.findall(text)
+    found += [_unglue(f) for f in EMAIL_FIND.findall(text)]
     out = []
     for f in found:
         e = clean_email(f)
@@ -138,6 +150,12 @@ def extract_emails(html: str) -> list[str]:
 
 
 _UNICODE_AT = re.compile(r"\\u0040|\\x40|&#0*64;|&#x0*40;|&commat;", re.I)
+_JSON_UNICODE = re.compile(r"\\u([0-9a-fA-F]{4})")
+_GLUED_TLD = re.compile(r"(\.[a-z]{2,3})[A-Z][a-z]+$")   # "info@x.itTel": text glued to the address
+
+
+def _unglue(found: str) -> str:
+    return _GLUED_TLD.sub(r"\1", found)
 
 
 def extract_embedded_emails(html: str) -> list[str]:
@@ -147,12 +165,20 @@ def extract_embedded_emails(html: str) -> list[str]:
     on the business's own domain (scripts often contain third-party addresses).
     """
     raw = _UNICODE_AT.sub("@", html)
+    # JSON-escaped script data ("\\u003einfo@x.it", "\\ninfo@x.it") must be unescaped first, otherwise the
+    # escape letters get glued onto the address ("u003einfo@x.it")
+    raw = _JSON_UNICODE.sub(lambda m: chr(int(m.group(1), 16)), raw)
+    raw = re.sub(r"\\[nrt]", " ", raw).replace("\\/", "/")
     out: list[str] = []
     for f in EMAIL_FIND.findall(raw):
-        e = clean_email(f)
+        e = clean_email(_unglue(f))
         if e and e not in out:
             out.append(e)
     return out
+
+
+_VAT = re.compile(r"(?:p\.?\s*iva|partita\s+iva|c\.?\s*f\.?|cod(?:ice)?\.?\s*fisc(?:ale)?\.?|\brea\b|cciaa|vat(?:\s*(?:no|number|id))?"
+                  r"|ust-?id(?:nr)?|siret|siren|nif|cif)\s*[:.\-]?\s*(?:[A-Z]{2}\s?)?[0-9][0-9 .\-/]{7,18}", re.I)
 
 
 def extract_phones(html: str, region: str | None) -> list[str]:
@@ -162,7 +188,7 @@ def extract_phones(html: str, region: str | None) -> list[str]:
         found.append(htmllib.unescape(a["href"][4:]).strip())
     for t in soup(["script", "style"]):
         t.decompose()
-    text = soup.get_text(" ")
+    text = _VAT.sub(" ", soup.get_text(" "))     # Italian P.IVA etc. parse as valid landline numbers
     for m in phonenumbers.PhoneNumberMatcher(text, (region or "").upper() or None,
                                              leniency=phonenumbers.Leniency.VALID):
         found.append(phonenumbers.format_number(m.number, phonenumbers.PhoneNumberFormat.E164))
@@ -229,11 +255,29 @@ def _get(session: requests.Session, url: str, timeout: float) -> tuple[str, str,
     try:
         html = ""
         if r.ok and "html" in r.headers.get("content-type", "html").lower():
-            body = r.raw.read(MAX_BYTES, decode_content=True)
-            html = body.decode(r.encoding or "utf-8", errors="replace")
+            html = _read_body(r, deadline=time.monotonic() + timeout * 2)
         return html, r.url, r.status_code
     finally:
         r.close()
+
+
+def _read_body(r, deadline: float) -> str:
+    """Read up to MAX_BYTES, but never longer than the deadline (a site that trickles bytes must not hang us)."""
+    chunks, size = [], 0
+    try:
+        while size < MAX_BYTES and time.monotonic() < deadline:
+            chunk = r.raw.read(65536, decode_content=True)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            size += len(chunk)
+    except (urllib3.exceptions.HTTPError, OSError, ValueError):
+        pass                                 # truncated / bad gzip: use what arrived
+    body = b"".join(chunks)
+    try:
+        return body.decode(r.encoding or "utf-8", errors="replace")
+    except LookupError:                      # bogus charset name in the headers
+        return body.decode("utf-8", errors="replace")
 
 
 def _absorb(info: SiteInfo, html: str, urls: list[str], region: str | None) -> None:
@@ -242,7 +286,7 @@ def _absorb(info: SiteInfo, html: str, urls: list[str], region: str | None) -> N
         if e not in info.emails:
             info.emails.append(e)
     for e in extract_embedded_emails(html):   # machine data: trust only the business's own domain
-        if e not in info.emails and any(same_site(e.split("@")[1], u) for u in urls):
+        if e not in info.emails and same_site(e.split("@")[1], urls[0]):
             info.emails.append(e)
     for p in extract_phones(html, region):
         if p not in info.phones:
@@ -277,7 +321,12 @@ def crawl(website: str, region: str | None, session: requests.Session, robots: R
     if not url:
         info.error = "invalid url"
         return info
-    first = _first_page(url, session, robots, timeout, info)
+    t0 = time.monotonic()
+    try:
+        first = _first_page(url, session, robots, timeout, info)
+    except Exception as e:                   # nothing a website does may crash the run
+        info.error = type(e).__name__
+        return info
     if first is None:
         return info
     html, final = first
@@ -288,7 +337,7 @@ def crawl(website: str, region: str | None, session: requests.Session, robots: R
     tried = {final.rstrip("/"), url.rstrip("/")}
     attempts = 1
     for page in contacts + guesses:
-        if attempts >= max_pages:
+        if attempts >= max_pages or time.monotonic() - t0 > CRAWL_BUDGET_S:
             break
         if page.rstrip("/") in tried or (page in guesses and info.emails):
             continue   # contact links are always read; blind guesses only while we still have no email
@@ -298,7 +347,7 @@ def crawl(website: str, region: str | None, session: requests.Session, robots: R
         attempts += 1
         try:
             html, _, _ = _get(session, page, timeout)
-        except requests.RequestException:
+        except Exception:
             continue
         if html:
             _absorb(info, html, urls, region)

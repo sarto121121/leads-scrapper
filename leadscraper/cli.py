@@ -47,6 +47,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="Also return leads that earlier runs already exported (default: only NEW leads)")
     p.add_argument("--reset-history", action="store_true", help="Forget all previously exported leads")
     p.add_argument("--history", help=f"History file (default: {default_path()})")
+    p.add_argument("--complete", action="store_true",
+                   help="Only leads that have ALL of: email, phone and address")
     p.add_argument("--keep-incomplete", action="store_true",
                    help="Also keep leads that have neither a phone nor an email (dropped by default)")
     p.add_argument("--no-website-crawl", action="store_true", help="Skip visiting websites (faster, fewer emails)")
@@ -89,6 +91,8 @@ class Collector:
             return False
         if a.require_phone and not l.phone:
             return False
+        if a.complete and not (l.email and l.phone and l.address):
+            return False
         has_site = bool(l.website)
         return not ((a.website == "yes" and not has_site) or (a.website == "no" and has_site))
 
@@ -111,16 +115,24 @@ class Collector:
                 continue
             fresh.append(l)
         if fresh:
-            if self.a.no_website_crawl:
+            try:
+                if self.a.no_website_crawl:
+                    finalize(fresh, self.region, not self.a.no_dns_check)
+                else:
+                    enrich_all(fresh, self.region, self.a.workers, self.a.timeout, not self.a.no_dns_check, _log,
+                               render=not self.a.no_render)
+            except Exception as e:      # never lose a batch because one website misbehaved
+                _log(f"  warning: website step failed ({type(e).__name__}: {str(e)[:100]}); using Maps data only")
                 finalize(fresh, self.region, not self.a.no_dns_check)
-            else:
-                enrich_all(fresh, self.region, self.a.workers, self.a.timeout, not self.a.no_dns_check, _log,
-                           render=not self.a.no_render)
             for l in fresh:
+                if self.done:           # only the wanted number is kept (and remembered)
+                    break
                 if not self.qualifies(l):
                     continue
                 if self._known(l):      # same phone/email as a lead we already have or exported
                     self.skipped += 1
+                    if l.email and not self.run.seen(l):
+                        self.hist.add([l])   # an older history file did not know this one had an email
                     continue
                 self.leads.append(l)
                 self.run.add([l])
@@ -145,39 +157,38 @@ def main(argv: list[str] | None = None) -> int:
              f"will be dropped; add --region XX (two-letter code, e.g. --region GB).")
 
     hist_path = Path(a.history) if a.history else default_path()
-    if a.reset_history and hist_path.exists():
-        hist_path.unlink()
-        _log(f"History cleared ({hist_path}).")
     hist = History(hist_path)
+    if a.reset_history:
+        hist.reset()
+        _log(f"History will be cleared ({hist_path}).")
     run = History(None)
     if hist.exported and not a.include_seen:
         _log(f"History: {hist.exported} leads exported before will be skipped (use --include-seen to keep them).")
 
     result: list[Lead] = []
     skipped_total = 0
+    stopped = ""            # why collection ended early (captcha, error, Ctrl+C), if it did
     for cat in categories:
         _log(f"\n=== {cat} in {a.city}, {a.country}"
              + (f" (target: exactly {a.count} leads) ===" if a.count else " ==="))
         col = Collector(a, region, hist, run)
         if use_maps:
-            try:
-                maps.search(a.city, a.country, cat, col.feed, areas, more_queries=bool(a.count),
-                            headless=not a.show_browser, log=_log,
-                            skip_ids=frozenset() if a.include_seen else frozenset(hist.skip_ids(a.require_email)),
-                            radius_km=a.radius if a.count else 0)
-            except maps.MapsError as e:
-                _log(f"Google Maps: {e}")
-                if not (use_api or use_osm) and not col.leads:
-                    return 1
+            err = _guarded(maps.search, a.city, a.country, cat, col.feed, areas, more_queries=bool(a.count),
+                           headless=not a.show_browser, log=_log,
+                           skip_ids=frozenset() if a.include_seen else frozenset(hist.skip_ids(a.require_email)),
+                           radius_km=a.radius if a.count else 0)
+            if err:
+                stopped = f"Google Maps: {err}"
+                _log(stopped)
         others: list[Lead] = []
-        if use_osm and not col.done:
+        if use_osm and not col.done and not stopped:
             try:
                 got, place = osm.search(a.city, a.country, cat, _log)
                 col.region = col.region or place.country_code
                 others += got
             except (ValueError, RuntimeError) as e:
                 _log(f"OpenStreetMap: {e}")
-        if use_api and not col.done:
+        if use_api and not col.done and not stopped:
             others += places.search(a.city, a.country, cat, log=_log)
         others.sort(key=lambda l: -(bool(l.website) + bool(l.raw_phones) + bool(l.raw_emails)))
         for i in range(0, len(others), 20):
@@ -185,42 +196,82 @@ def main(argv: list[str] | None = None) -> int:
                 break
         leads = col.leads[:a.count] if a.count else col.leads
         if a.count and len(leads) < a.count:
-            _log(f"Only {len(leads)} of the {a.count} requested '{cat}' leads exist for these filters. "
-                 f"To get more: raise --radius (now {a.radius:g} km), add --areas \"Area1,Area2,...\", "
-                 f"try another business type, or relax --require-email/--require-phone/--website.")
+            if stopped:
+                _log(f"STOPPED EARLY with {len(leads)} of {a.count} '{cat}' leads - this is NOT the end of the "
+                     f"list. Run the same command again later: your history keeps these {len(leads)} and the "
+                     f"run continues with new ones.")
+            else:
+                _log(f"Only {len(leads)} of the {a.count} requested '{cat}' leads exist for these filters. "
+                     f"To get more: raise --radius (now {a.radius:g} km), add --areas \"Area1,Area2,...\", "
+                     f"try another business type, or relax --require-email/--require-phone/--website.")
         if col.skipped:
             _log(f"  skipped {col.skipped} leads already exported before or duplicated in this run")
         skipped_total += col.skipped
         run.add(leads)
         result += leads
+        if stopped:
+            break
 
     if not result:
-        if skipped_total:
+        if hist.dirty and not stopped:
+            hist.save()
+        if stopped:
+            _log("Nothing collected before the run stopped; nothing was saved.")
+        elif skipped_total:
             _log(f"No NEW leads: all {skipped_total} matches were already exported in earlier runs. Try "
-                 f"--areas for other neighbourhoods, a different city/type, or --include-seen.")
+                 f"--radius/--areas for other places, a different city/type, or --include-seen.")
         else:
             _log("No leads found. Try a broader business type or a larger city.")
         return 1
 
     result.sort(key=lambda l: -(bool(l.email) + bool(l.phone)))
     hist.add(result)
-    out = a.output or f"leads_{safe_filename(a.category, a.city, a.country)}.xlsx"
+    default_name = f"leads_{safe_filename(a.category, a.city, a.country)}_{datetime.now():%Y%m%d_%H%M}.xlsx"
+    out = _unique_path(a.output or default_name)       # never overwrite an earlier file
+    if a.output and out != a.output:
+        _log(f"{a.output} already exists - saving to {out} instead so nothing is overwritten.")
     meta = {"Country": a.country, "City": a.city, "Categories": ", ".join(categories),
             "Sources": ", ".join(sorted({x for l in result for x in l.source.split(' + ')}))}
     try:
+        Path(out).parent.mkdir(parents=True, exist_ok=True)
         write_xlsx(result, out, meta)
-    except PermissionError:   # the file is open in Excel
-        out = out.removesuffix(".xlsx") + f"_{datetime.now():%H%M%S}.xlsx"
-        _log(f"Could not overwrite the file (is it open in Excel?). Saving as {out} instead.")
+    except OSError as e:
+        out = _unique_path(f"leads_rescued_{datetime.now():%Y%m%d_%H%M%S}.xlsx")
+        _log(f"Could not write the requested file ({e}). Saving to {out} instead.")
         write_xlsx(result, out, meta)
     hist.save()
     _log(f"\nDone: {len(result)} leads "
          f"({sum(bool(l.email) for l in result)} with email, {sum(bool(l.phone) for l in result)} with phone, "
-         f"{sum(bool(l.website) for l in result)} with website)\nSaved to {out}\n"
+         f"{sum(bool(l.website) for l in result)} with website)\nSaved to {Path(out).resolve()}\n"
          f"History: {hist.exported} leads remembered in {hist_path} (next run returns only new ones)")
     no_site = sum(not l.website for l in result)
-    if not a.require_email and sum(bool(l.email) for l in result) < 0.7 * len(result):
+    if not a.require_email and no_site and sum(bool(l.email) for l in result) < 0.7 * len(result):
         _log(f"Tip: {no_site} of these {len(result)} leads have no website, so there is no page to read an "
              f"email from. For cold emailing add --require-email (with -n N): it keeps searching until it "
              f"has N leads that ALL have an email.")
     return 0
+
+
+def _unique_path(path: str) -> str:
+    """`path`, or path_2, path_3 ... if it already exists - results are never overwritten."""
+    p = Path(path)
+    if not p.exists():
+        return path
+    for i in range(2, 10_000):
+        cand = p.with_name(f"{p.stem}_{i}{p.suffix}")
+        if not cand.exists():
+            return str(cand)
+    return path
+
+
+def _guarded(fn, *args, **kw) -> str:
+    """Run a collection step; return '' on success or a reason string. Leads already collected are kept."""
+    try:
+        fn(*args, **kw)
+        return ""
+    except KeyboardInterrupt:
+        return "interrupted with Ctrl+C - saving what was collected so far"
+    except maps.MapsError as e:
+        return str(e)
+    except Exception as e:     # a browser/network hiccup must not throw away an hour of work
+        return f"{type(e).__name__}: {str(e)[:200]}"

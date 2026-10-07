@@ -16,7 +16,10 @@ JUNK_DOMAINS = {"example.com", "example.org", "domain.com", "email.com", "yourdo
                 "yoursite.com", "mysite.com", "sentry.io", "wixpress.com", "sentry-next.wixpress.com",
                 "test.com", "company.com", "website.com", "godaddy.com", "latofonts.com"}
 JUNK_LOCAL = re.compile(r"^(no-?reply|do-?not-?reply|mailer-daemon|postmaster|abuse|webmaster|"
-                        r"user|name|your-?email|youremail|email|test|admin@admin)$")
+                        r"user|name|your-?email|youremail|email|test|admin@admin)$"
+                        # addresses that exist for legal/press/privacy requests, never for a sales enquiry
+                        r"|^(privacy|gdpr|dpo|press|stampa|legal|cookie|unsubscribe|security|copyright|"
+                        r"datenschutz|rgpd|abuse)([._-].*)?$")
 ROLE_LOCAL = {"info", "contact", "sales", "support", "hello", "office", "admin", "enquiries",
               "inquiries", "enquiry", "service", "booking", "reservations", "mail", "team"}
 
@@ -44,23 +47,27 @@ def check_domain(domain: str, timeout: float = 4.0) -> str:
     with _mx_lock:
         if domain in _mx_cache:
             return _mx_cache[domain]
-    res = dns.resolver.Resolver()
-    res.lifetime = timeout
     status = "unknown"
-    try:
+    for _ in range(2):                      # a DNS timeout is not a verdict: ask once more before giving up
         try:
-            ans = res.resolve(domain, "MX")
-            # "null MX" (RFC 7505) means the domain accepts no mail
-            status = "invalid" if all(str(r.exchange) == "." for r in ans) else "ok"
-        except dns.resolver.NoAnswer:
-            res.resolve(domain, "A")  # implicit MX
-            status = "ok"
-    except (dns.resolver.NXDOMAIN, dns.resolver.NoAnswer):
-        status = "invalid"
-    except (dns.exception.DNSException, OSError):
-        status = "unknown"
-    with _mx_lock:
-        _mx_cache[domain] = status
+            res = dns.resolver.Resolver()
+            res.lifetime = timeout
+            try:
+                ans = res.resolve(domain, "MX")
+                # "null MX" (RFC 7505) means the domain accepts no mail
+                status = "invalid" if all(str(r.exchange) == "." for r in ans) else "ok"
+            except dns.resolver.NoAnswer:
+                res.resolve(domain, "A")  # implicit MX
+                status = "ok"
+        except (dns.resolver.NXDOMAIN, dns.resolver.NoAnswer):
+            status = "invalid"
+        except (dns.exception.DNSException, OSError):
+            status = "unknown"
+        if status != "unknown":
+            break
+    if status != "unknown":                 # only real answers are cached
+        with _mx_lock:
+            _mx_cache[domain] = status
     return status
 
 
@@ -131,6 +138,9 @@ def normalize_phone(raw: str, region: str | None) -> tuple[str, str, str] | None
 
 def best_phone(raws: list[str], region: str | None) -> tuple[str, str, str]:
     for raw in raws:
+        whole = normalize_phone(raw, region)       # "0321/123456" is ONE number written with a slash
+        if whole:
+            return whole
         for part in re.split(r"[;/|]|\s{2,}|,(?=\s*\+)", raw):
             r = normalize_phone(part, region)
             if r:

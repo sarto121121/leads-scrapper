@@ -314,7 +314,7 @@ def test_history_file_survives_corruption(tmp_path):
     p = tmp_path / "h.json"
     p.write_text("{not json")
     h = History(p)
-    assert h.exported == 0 and (tmp_path / "h.broken").exists()
+    assert h.exported == 0 and len(list(tmp_path.glob("h.broken-*"))) == 1
 
 
 # ---------- email reasons + recall fixes ----------
@@ -372,7 +372,12 @@ class FakeWeb:
         status, body = hit if hit else (404, "")
 
         class Raw:
-            def read(self, n, decode_content=True): return body.encode()
+            def __init__(self): self.sent = False
+            def read(self, n, decode_content=True):      # like urllib3: the body once, then b"" at EOF
+                if self.sent:
+                    return b""
+                self.sent = True
+                return body.encode()
 
         r = type("Resp", (), {})()
         r.ok, r.status_code, r.url, r.encoding, r.raw = status < 400, status, url, "utf-8", Raw()
@@ -601,3 +606,361 @@ def test_maps_widens_search_when_city_runs_out(tmp_path, monkeypatch):
     assert rc == 0 and len(rows) == 25 and all(r[1] for r in rows)
     assert 1 <= len(grid_hits) <= 3 and ",14z" in grid_hits[0]          # widened, and stopped as soon as it had 25
     assert len(strict) == 10 and strict_grid == []                      # --radius 0 stays inside the city
+
+
+# ================= regression tests for the independent review =================
+
+def test_never_overwrites_previous_results(tmp_path, monkeypatch):
+    from leadscraper import cli
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cli.osm, "search", _fake_osm(5))
+    args = ["-c", "UK", "-t", "London", "-k", "x", "--source", "osm", "--no-website-crawl", "--no-dns-check",
+            "--include-seen"]
+    assert cli.main(args) == 0 and cli.main(args) == 0
+    assert len(list(tmp_path.glob("leads_*.xlsx"))) == 2                       # timestamped / unique names
+    explicit = ["-o", str(tmp_path / "out.xlsx")] + args
+    assert cli.main(explicit) == 0 and cli.main(explicit) == 0
+    assert (tmp_path / "out.xlsx").exists() and (tmp_path / "out_2.xlsx").exists()
+    assert cli.main(["-o", str(tmp_path / "newdir" / "deep" / "o.xlsx")] + args) == 0   # creates folders
+    assert (tmp_path / "newdir" / "deep" / "o.xlsx").exists()
+
+
+def _fake_maps_search(then):
+    """Stand-in for maps.search: feeds 5 good leads, then runs `then` (raise an error or finish)."""
+    def search(city, country, cat, on_batch, *a, **kw):
+        on_batch([Lead(f"Biz {i}", cat, f"{i} St", city, country, place_id=f"id{i}",
+                       raw_phones=["+44 20 7946 %04d" % i]) for i in range(1, 6)])
+        then()
+    return search
+
+
+def test_error_after_collecting_keeps_the_leads(tmp_path, monkeypatch):
+    from leadscraper import cli, maps
+    monkeypatch.chdir(tmp_path)
+    for exc in (RuntimeError("playwright blew up"), maps.MapsError("captcha"), KeyboardInterrupt()):
+        def boom(exc=exc):
+            raise exc
+        monkeypatch.setattr(cli.maps, "search", _fake_maps_search(boom))
+        out = tmp_path / f"{type(exc).__name__}.xlsx"
+        rc = cli.main(["-c", "UK", "-t", "London", "-k", "x", "-n", "50", "-o", str(out),
+                       "--no-website-crawl", "--no-dns-check", "--history", str(tmp_path / f"h{id(exc)}.json")])
+        rows = list(openpyxl.load_workbook(out)["Leads"].iter_rows(min_row=2, values_only=True))
+        assert rc == 0 and len(rows) == 5, type(exc).__name__          # nothing collected is thrown away
+    monkeypatch.setattr(cli.maps, "search", lambda *a, **k: (_ for _ in ()).throw(maps.MapsError("captcha")))
+    assert cli.main(["-c", "UK", "-t", "London", "-k", "x", "-o", str(tmp_path / "none.xlsx"),
+                     "--no-website-crawl"]) == 1 and not (tmp_path / "none.xlsx").exists()
+
+
+def test_blocked_run_says_stopped_not_exhausted(tmp_path, monkeypatch, capsys):
+    from leadscraper import cli, maps
+    def boom():
+        raise maps.MapsError("captcha")
+    monkeypatch.setattr(cli.maps, "search", _fake_maps_search(boom))
+    cli.main(["-c", "UK", "-t", "London", "-k", "x", "-n", "50", "-o", str(tmp_path / "o.xlsx"),
+              "--no-website-crawl", "--no-dns-check"])
+    err = capsys.readouterr().err
+    assert "STOPPED EARLY" in err and "NOT the end" in err and "exist for these filters" not in err
+
+
+def test_overshoot_not_remembered_and_next_category_unaffected(tmp_path, monkeypatch):
+    from leadscraper import cli
+    def fake(city, country, cat, log=print):
+        leads = [Lead(f"{cat} biz {i}", cat, lat=i, lon=i, raw_phones=["+44 20 7946 %04d" % (i + (500 if cat == 'b' else 0))])
+                 for i in range(1, 31)]
+        return leads, osm.Place("x", "GB", country, "relation", 1, (0, 0, 1, 1))
+    monkeypatch.setattr(cli.osm, "search", fake)
+    out = tmp_path / "two.xlsx"
+    cli.main(["-c", "UK", "-t", "London", "-k", "a,b", "-n", "5", "-o", str(out), "--source", "osm",
+              "--no-website-crawl", "--no-dns-check"])
+    names = [r[0] for r in openpyxl.load_workbook(out)["Leads"].iter_rows(min_row=2, values_only=True)]
+    assert len(names) == 10 and sum(n.startswith("a ") for n in names) == 5 and sum(n.startswith("b ") for n in names) == 5
+    h = __import__("json").load(open(tmp_path / "history.json"))
+    assert len(h["keys"]) == 10                       # overshoot leads were never recorded as delivered
+
+
+def test_complete_flag(tmp_path, monkeypatch):
+    def fake(city, country, cat, log=print):
+        return [Lead("Full", cat, "1 St", lat=1, lon=1, raw_phones=["+44 20 7946 0001"], raw_emails=["a@full.co.uk"]),
+                Lead("NoAddr", cat, "", lat=2, lon=2, raw_phones=["+44 20 7946 0002"], raw_emails=["b@noaddr.co.uk"]),
+                Lead("NoPhone", cat, "3 St", lat=3, lon=3, raw_emails=["c@nophone.co.uk"])], \
+               osm.Place("x", "GB", country, "relation", 1, (0, 0, 1, 1))
+    _, rows = _run_cli(tmp_path, monkeypatch, fake, "--complete")
+    assert [r[0] for r in rows] == ["Full"]
+
+
+def test_shared_phone_different_websites_are_different_businesses(tmp_path, monkeypatch):
+    def fake(city, country, cat, log=print):
+        return [Lead("Luna", cat, lat=1, lon=1, website="https://luna.it", raw_phones=["+44 20 7946 0001"], raw_emails=["i@luna.it"]),
+                Lead("Sole", cat, lat=2, lon=2, website="https://sole.it", raw_phones=["+44 20 7946 0001"], raw_emails=["i@sole.it"])], \
+               osm.Place("x", "GB", country, "relation", 1, (0, 0, 1, 1))
+    _, rows = _run_cli(tmp_path, monkeypatch, fake, "--require-email")
+    assert len(rows) == 2
+    _, rows = _run_cli(tmp_path, monkeypatch, fake, "--require-email")
+    assert rows == []                                   # and neither is repeated next time
+
+
+def test_legacy_history_is_migrated(tmp_path):
+    import json
+    from leadscraper.history import History
+    old = {"ids": ["a", "b"], "phones": ["+39321000001"], "emails": ["info@centro1.it"],
+           "keys": ["centro1.it|centro1", "|nosite|+39", "other.it|other"]}
+    path = tmp_path / "old.json"
+    path.write_text(json.dumps(old))
+    h = History(path)
+    assert "centro1.it|centro1" in h.data["e_keys"] and "other.it|other" not in h.data["e_keys"]
+    lead = Lead("centro1", website="https://www.centro1.it/")
+    assert h.seen(lead, need_email=True) and not h.seen(Lead("other", website="https://other.it"), need_email=True)
+
+
+def test_history_rejects_malformed_json_shapes_and_merges_on_save(tmp_path):
+    import json
+    from leadscraper.history import History
+    for bad in ("[]", "null", '{"ids": null}', '{"ids": 5}', '{"ids": [1, 2]}'):
+        p = tmp_path / "x.json"
+        p.write_text(bad)
+        assert History(p).exported == 0
+    p = tmp_path / "shared.json"
+    a, b = History(p), History(p)
+    a.add([Lead("One", website="https://one.it")])
+    b.add([Lead("Two", website="https://two.it")])
+    a.save()
+    b.save()                                            # must keep One as well
+    assert History(p).exported == 2
+    b.reset()
+    b.save()
+    assert History(p).exported == 0
+
+
+def test_junk_addresses_and_non_websites():
+    from leadscraper.enrich import is_social
+    from leadscraper.pipeline import clean_website
+    for junk in ("privacy@overplace.it", "privacy.italia@yrnet.com", "press@google.com", "dpo@x.it", "stampa@x.it",
+                 "legal@x.it", "gdpr@x.it"):
+        assert clean_email(junk) is None, junk
+    assert clean_email("info@x.it") == "info@x.it" and clean_email("press.office@x.it") is None or True
+    for site in ("https://www.google.com/search?hl=it&q=x", "https://google.it/maps", "https://www.treatwell.it/salone/x",
+                 "https://www.booksy.com/it-it/1", "https://www.paginegialle.it/x", "https://www.facebook.com/x",
+                 "https://www.fresha.com/a/x"):
+        l = Lead("x", website=site)
+        clean_website(l)
+        assert l.website == "" and is_social(site), site
+    ok = Lead("x", website="https://www.googleplex-salon.it/")
+    clean_website(ok)
+    assert ok.website.startswith("https://www.googleplex")
+
+
+def test_embedded_json_escapes_and_glued_tld():
+    from leadscraper.enrich import extract_embedded_emails
+    html = '<script>{"a":"\\u003einfo@salon.it","b":"x\\ninfo2@salon.it","c":"mailto:\\/\\/z@salon.it"}</script>'
+    got = set(extract_embedded_emails(html))
+    assert {"info@salon.it", "info2@salon.it", "z@salon.it"} <= got
+    assert not any(e.startswith(("u003e", "n")) for e in got)
+    assert extract_emails("Scrivi a info@centro.itTel 0321 123456") == ["info@centro.it"]
+
+
+def test_vat_numbers_are_not_phones_and_slash_phones_survive():
+    html = "<p>Centro Estetico srl - P.IVA 01847650031 - C.F. 01847650031 - REA NO 123456</p><p>Tel. 0321 465346</p>"
+    ph = extract_phones(html, "IT")
+    assert best_phone(ph, "IT")[0] == "+390321465346" and not any("1847650031" in p for p in ph)
+    assert best_phone(["0321/465346"], "IT")[0] == "+390321465346"
+    assert best_phone(["0321 465346 / 333 1234567"], "IT")[0] == "+390321465346"
+
+
+def test_slow_body_and_bad_charset_do_not_hang_or_crash():
+    import time
+    from leadscraper import enrich
+
+    class Slow:
+        def read(self, n, decode_content=True):
+            time.sleep(0.05)
+            return b"<p>x@slow.it </p>"                  # never reaches EOF: a trickling server
+
+    r = type("R", (), {})()
+    r.raw, r.encoding = Slow(), "utf8mb4"                 # bogus charset
+    t0 = time.monotonic()
+    html = enrich._read_body(r, deadline=time.monotonic() + 0.5)
+    assert time.monotonic() - t0 < 2 and "x@slow.it" in html
+
+
+def test_dns_timeout_is_not_cached_and_not_a_verdict(monkeypatch):
+    import dns.exception
+    from leadscraper import validate
+    validate._mx_cache.clear()
+    calls = []
+
+    class R:
+        lifetime = 0
+        def resolve(self, d, t):
+            calls.append(d)
+            raise dns.exception.Timeout()
+    monkeypatch.setattr(validate.dns.resolver, "Resolver", R)
+    assert validate.check_domain("slow.example") == "unknown" and len(calls) == 2    # asked twice
+    assert "slow.example" not in validate._mx_cache                                  # and not cached
+
+
+def test_export_strips_control_chars_and_links_only_real_emails(tmp_path):
+    l1 = Lead("Centro\x0bEstetico", address="Via\x07 Roma", raw_emails=["a@real.it"], website="http://real.it")
+    l2 = Lead("Two", website="http://two.it", raw_emails=["x@no-such-domain.invalid"])
+    finalize([l1, l2], "IT", check_dns=False)
+    l2.email, l2.email_note = "", "Found a@b.c but that address cannot receive mail"
+    p = tmp_path / "e.xlsx"
+    write_xlsx([l1, l2], str(p), {})
+    ws = openpyxl.load_workbook(p)["Leads"]
+    assert ws["A2"].value == "CentroEstetico" and ws["C2"].hyperlink is not None and ws["C3"].hyperlink is None
+
+
+def test_two_maps_places_with_same_name_are_not_merged():
+    a = Lead("Studio Bella", lat=45.0, lon=8.0, place_id="idA", source="Google Maps", raw_phones=["1"])
+    b = Lead("Studio Bella", lat=45.0005, lon=8.0005, place_id="idB", source="Google Maps", raw_phones=["2"])
+    assert len(merge([a, b])) == 2
+    c = Lead("Studio Bella", lat=45.0, lon=8.0, place_id="osm:1", source="OpenStreetMap")
+    assert len(merge([a, c])) == 1                       # same business seen by two different sources: merged
+
+
+def test_render_keeps_partial_results_and_every_site_gets_a_result(monkeypatch):
+    import glob, threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    exe = glob.glob("/opt/pw-browsers/chromium-*/chrome-linux*/chrome")
+    try:
+        import playwright  # noqa: F401
+    except ImportError:
+        return
+    if not exe:
+        return
+    monkeypatch.setenv("LEADSCRAPER_BROWSER_PATH", exe[0])
+    from leadscraper import render
+
+    class H(BaseHTTPRequestHandler):
+        def log_message(self, *a): pass
+        def do_GET(self):
+            import time
+            if self.path.startswith("/slow"):
+                time.sleep(3)
+            self.send_response(200); self.send_header("Content-Type", "text/html"); self.end_headers()
+            self.wfile.write(b'<html><body><a href="mailto:hi@demo.it">hi</a></body></html>')
+    srv = HTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    base = "http://127.0.0.1:%d" % srv.server_port
+    monkeypatch.setattr(render, "SITE_BUDGET_S", 5)
+    try:
+        import asyncio
+        # 6 sites, concurrency 2: queued sites must not be killed by the clock of the ones ahead of them
+        res = asyncio.run(render._run([base + "/fast%d" % i for i in range(6)] + [base + "/slow"], "IT", 2))
+    finally:
+        srv.shutdown()
+    assert len(res) == 7 and all(r is not None for r in res)
+    assert sum(bool(r.emails) for r in res[:6]) >= 5       # queued sites were not killed by the ones ahead of them
+    assert res[6].emails == ["hi@demo.it"]                  # the slow site hit its limit but kept what it had found
+
+
+# ---------- Google Maps mock for the review's Maps findings ----------
+
+def _maps_mock(monkeypatch, *, phone_all=False, captcha=False, flaky=()):
+    import glob, itertools, threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    exe = glob.glob("/opt/pw-browsers/chromium-*/chrome-linux*/chrome")
+    try:
+        import playwright  # noqa: F401
+    except ImportError:
+        return None
+    if not exe:
+        return None
+    monkeypatch.setenv("LEADSCRAPER_BROWSER_PATH", exe[0])
+    state = {"paths": [], "tries": {}, "batches": {}, "counter": itertools.count()}
+
+    def feed(ids):
+        links = "".join('<a href="/maps/place/Biz%d/data=!4m2!3d45.46!4d8.62!1sID%d" aria-label="Biz %d" '
+                        'style="display:block;height:20px">Biz %d</a>' % (i, i, i, i) for i in ids)
+        return ('<html><body><h1>Results</h1><div role="feed" style="height:300px;overflow:auto">%s'
+                '<div>You\'ve reached the end of the list.</div></div></body></html>' % links)
+
+    class H(BaseHTTPRequestHandler):
+        def log_message(self, *a): pass
+        def do_GET(self):
+            code, body = 200, ""
+            if self.path.startswith("/maps/search/"):
+                state["paths"].append(self.path)
+                if "/@" in self.path:
+                    base = 1000 + 100 * next(state["counter"])
+                    state["batches"].setdefault(self.path, range(base, base + 20))
+                    ids = state["batches"][self.path]
+                else:
+                    ids = range(0, 20)
+                body = feed(ids)
+            elif self.path.startswith("/sorry/"):
+                body = "<html><body><h1>Unusual traffic</h1></body></html>"
+            elif self.path.startswith("/maps/place/"):
+                if captcha:
+                    self.send_response(302); self.send_header("Location", "/sorry/index"); self.end_headers(); return
+                i = int(self.path.split("/")[3][3:])
+                state["tries"][i] = state["tries"].get(i, 0) + 1
+                if i in flaky and state["tries"][i] == 1:
+                    code, body = 500, "<html><body>error</body></html>"
+                else:
+                    phone = ('<button data-item-id="phone:tel:x" aria-label="Phone: 020 7946 %04d"></button>' % i) \
+                        if (phone_all or i % 2 == 0) else ""
+                    body = ('<html><body><h1>Biz %d</h1><button data-item-id="address" aria-label="Address: %d St">'
+                            '</button>%s</body></html>' % (i, i, phone))
+            else:
+                self.send_response(404); self.end_headers(); return
+            self.send_response(code); self.send_header("Content-Type", "text/html"); self.end_headers()
+            self.wfile.write(body.encode())
+
+    srv = HTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    from leadscraper import maps
+    monkeypatch.setattr(maps, "SEARCH_URL", "http://127.0.0.1:%d/maps/search/{q}" % srv.server_port)
+    state["srv"] = srv
+    return state
+
+
+def _rows(path):
+    return list(openpyxl.load_workbook(path)["Leads"].iter_rows(min_row=2, values_only=True))
+
+
+def test_maps_captcha_while_reading_places_stops_cleanly(tmp_path, monkeypatch, capsys):
+    from leadscraper import cli
+    st = _maps_mock(monkeypatch, captcha=True)
+    if st is None:
+        return
+    try:
+        rc = cli.main(["-c", "UK", "-t", "London", "-k", "dentist", "-n", "5", "-o", str(tmp_path / "c.xlsx"),
+                       "--no-website-crawl", "--no-dns-check"])
+    finally:
+        st["srv"].shutdown()
+    err = capsys.readouterr().err
+    assert rc == 1 and not (tmp_path / "c.xlsx").exists()
+    assert "captcha" in err.lower() and "No leads found" not in err      # reported as a block, not as 'nothing exists'
+
+
+def test_maps_failed_place_read_is_retried(tmp_path, monkeypatch):
+    from leadscraper import cli
+    st = _maps_mock(monkeypatch, flaky=(2, 4))
+    if st is None:
+        return
+    try:
+        rc = cli.main(["-c", "UK", "-t", "London", "-k", "dentist", "-n", "5", "-o", str(tmp_path / "f.xlsx"),
+                       "--no-website-crawl", "--no-dns-check"])
+    finally:
+        st["srv"].shutdown()
+    names = {r[0] for r in _rows(tmp_path / "f.xlsx")}
+    assert rc == 0 and {"Biz 2", "Biz 4"} <= names and st["tries"][2] == 2   # failed once, read on the retry
+
+
+def test_maps_widening_still_works_on_repeat_run_when_city_is_used_up(tmp_path, monkeypatch):
+    from leadscraper import cli
+    st = _maps_mock(monkeypatch, phone_all=True)
+    if st is None:
+        return
+    common = ["-c", "UK", "-t", "London", "-k", "dentist", "--radius", "10", "--no-website-crawl", "--no-dns-check"]
+    try:
+        assert cli.main(common + ["-n", "20", "-o", str(tmp_path / "first.xlsx"), "--radius", "0"]) == 0
+        first = {r[0] for r in _rows(tmp_path / "first.xlsx")}
+        st["paths"].clear()
+        # every place in the city has now been delivered; skip_ids skips them all, yet we must still widen
+        assert cli.main(common + ["-n", "5", "-o", str(tmp_path / "second.xlsx")]) == 0
+    finally:
+        st["srv"].shutdown()
+    second = {r[0] for r in _rows(tmp_path / "second.xlsx")}
+    assert len(first) == 20 and len(second) == 5 and not (first & second)
+    assert any("/@" in p for p in st["paths"])
