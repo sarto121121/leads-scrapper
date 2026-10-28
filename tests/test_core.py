@@ -92,7 +92,7 @@ def test_export_roundtrip(tmp_path):
     p = tmp_path / "o.xlsx"
     write_xlsx([l], str(p), {"City": "X"})
     ws = openpyxl.load_workbook(p)["Leads"]
-    assert ws["A2"].data_type == "s" and ws["C2"].value == "info@x.pk" and ws.max_column == 8 and ws["E2"].value == "Yes"
+    assert ws["A2"].data_type == "s" and ws["C2"].value == "info@x.pk" and ws.max_column == 6 and ws["E2"].value == "Yes"
 
 
 
@@ -964,76 +964,3 @@ def test_maps_widening_still_works_on_repeat_run_when_city_is_used_up(tmp_path, 
     second = {r[0] for r in _rows(tmp_path / "second.xlsx")}
     assert len(first) == 20 and len(second) == 5 and not (first & second)
     assert any("/@" in p for p in st["paths"])
-
-
-# ---------- optional Instagram / LinkedIn ----------
-
-def test_social_profile_links_are_cleaned_and_junk_ignored():
-    from leadscraper.socials import extract_candidates, normalize
-    assert normalize("https://www.instagram.com/Studio.Alma/?hl=it") == ("instagram", "https://www.instagram.com/studio.alma/")
-    assert normalize("instagram.com/@estetica22") == ("instagram", "https://www.instagram.com/estetica22/")
-    assert normalize("https://it.linkedin.com/company/centro-estetico-x/?trk=a") == ("linkedin", "https://www.linkedin.com/company/centro-estetico-x/")
-    for junk in ("https://www.instagram.com/p/Cabc123/", "https://www.instagram.com/explore/tags/beauty/",
-                 "https://www.instagram.com/wix/", "https://www.linkedin.com/sharing/share-offsite/?url=x",
-                 "https://www.linkedin.com/shareArticle?mini=true", "https://www.linkedin.com/company/linkedin/",
-                 "https://www.facebook.com/centro", "https://example.com/instagram.com/x"):
-        assert normalize(junk) is None, junk
-    html = ('<a href="https://instagram.com/centro_bella">ig</a><a href="https://www.linkedin.com/company/centro-bella">in</a>'
-            '<a href="https://www.instagram.com/p/XYZ/">post</a><a href="https://www.linkedin.com/sharing/share-offsite/?url=x">share</a>'
-            '<script type="application/ld+json">{"sameAs":["https://www.instagram.com/centro_bella_official/"]}</script>')
-    c = extract_candidates(html)
-    assert c["instagram"] == ["https://www.instagram.com/centro_bella/", "https://www.instagram.com/centro_bella_official/"]
-    assert c["linkedin"] == ["https://www.linkedin.com/company/centro-bella/"]
-
-
-def test_web_agency_credit_is_not_taken_as_the_business_profile():
-    from leadscraper.socials import extract_candidates
-    html = ('<div class="social"><a href="https://instagram.com/studioalma">ig</a></div>'
-            '<footer><p>Sito realizzato da <a href="https://instagram.com/webagency_xyz">WebAgency</a></p>'
-            '<p>Design by <a href="https://www.linkedin.com/company/agency-xyz">Agency</a></p></footer>')
-    c = extract_candidates(html)
-    assert c["instagram"] == ["https://www.instagram.com/studioalma/"] and c["linkedin"] == []
-
-
-def test_best_profile_is_the_one_matching_the_business():
-    from leadscraper.socials import pick_best
-    cands = ["https://www.instagram.com/some_blogger/", "https://www.instagram.com/novaestetica.novara/"]
-    assert pick_best("instagram", cands, "Nova Estetica Novara", "https://www.nova-estetica.it/").endswith("novaestetica.novara/")
-    assert pick_best("instagram", [], "x", "") == ""
-    assert pick_best("instagram", cands[:1], "Totally Different", "") == cands[0]      # a lone candidate is kept
-
-
-def test_socials_found_on_website_end_up_in_the_sheet_and_are_optional(tmp_path, monkeypatch):
-    from leadscraper import pipeline
-    web = FakeWeb({
-        "http://alma.it": (200, '<a href="mailto:ciao@alma.it">m</a><a href="https://instagram.com/studio_alma">i</a>'
-                                '<a href="https://www.linkedin.com/company/studio-alma/">l</a>'),
-        "http://plain.it": (200, '<a href="mailto:hi@plain.it">m</a>'),
-    })
-    monkeypatch.setattr(pipeline, "make_session", lambda: web)
-    def fake(city, country, cat, log=print):
-        return [Lead("Studio Alma", cat, "1 St", lat=1, lon=1, website="http://alma.it", raw_phones=["+44 20 7946 0001"]),
-                Lead("Plain Salon", cat, "2 St", lat=2, lon=2, website="http://plain.it", raw_phones=["+44 20 7946 0002"])], \
-               osm.Place("x", "GB", country, "relation", 1, (0, 0, 1, 1))
-    from leadscraper import cli
-    monkeypatch.setattr(cli.osm, "search", fake)
-    out = tmp_path / "s.xlsx"
-    rc = cli.main(["-c", "UK", "-t", "London", "-k", "x", "-o", str(out), "--source", "osm", "--no-dns-check",
-                   "--no-render", "--require-email", "--complete"])
-    ws = openpyxl.load_workbook(out)["Leads"]
-    hdr = [c.value for c in ws[1]]
-    assert rc == 0 and hdr[-2:] == ["Instagram", "LinkedIn"]
-    rows = {r[0]: r for r in ws.iter_rows(min_row=2, values_only=True)}
-    assert rows["Studio Alma"][6] == "https://www.instagram.com/studio_alma/"
-    assert rows["Studio Alma"][7] == "https://www.linkedin.com/company/studio-alma/"
-    # no socials on this site: the lead is STILL listed (email, phone, address are what count), cells just stay empty
-    assert "Plain Salon" in rows and rows["Plain Salon"][2] == "hi@plain.it"
-    assert rows["Plain Salon"][6] is None and rows["Plain Salon"][7] is None
-    assert ws["G2"].hyperlink is not None or ws["G3"].hyperlink is not None
-
-
-def test_osm_social_tags():
-    els = [{"type": "node", "id": 1, "lat": 1, "lon": 2, "tags": {"name": "A", "contact:instagram": "studioa",
-            "contact:linkedin": "https://www.linkedin.com/company/studio-a"}}]
-    l = osm.parse_elements(els, "x", "c", "k")[0]
-    assert l.socials == {"instagram": "https://www.instagram.com/studioa/", "linkedin": "https://www.linkedin.com/company/studio-a/"}

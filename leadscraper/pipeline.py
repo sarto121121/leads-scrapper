@@ -9,7 +9,6 @@ from urllib.parse import urlparse
 
 from .enrich import Robots, crawl, is_social, make_session
 from .render import render_missing
-from .socials import add_to_lead as add_socials
 from .models import Lead
 from .validate import best_phone, verify_emails
 
@@ -82,7 +81,8 @@ def enrich_all(leads: list[Lead], region: str | None, workers: int = 24, timeout
         l.raw_emails += [e for e in info.emails if e not in l.raw_emails]
         # phones from the website are only a fallback, listed after directory data
         l.raw_phones += [p for p in info.phones[:3] if p not in l.raw_phones]
-        add_socials(l, info.socials)
+        for k, v in info.socials.items():
+            l.socials.setdefault(k, v)
         with lock:
             done[0] += 1
             if done[0] % 10 == 0 or done[0] == len(todo):

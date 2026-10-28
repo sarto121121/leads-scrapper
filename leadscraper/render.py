@@ -12,7 +12,6 @@ from urllib.parse import urljoin
 from .browser import launch_kwargs
 from .enrich import GUESS_PATHS, SiteInfo, UA, _absorb, _candidates, _contact_links, normalize_url
 from .models import Lead
-from .socials import add_to_lead as add_socials
 
 PAGE_TIMEOUT_MS = 25000
 SITE_BUDGET_S = 90
@@ -129,7 +128,8 @@ def render_missing(leads: list[Lead], region: str | None, concurrency: int = 4, 
         had = bool(l.raw_emails)
         l.raw_emails += [e for e in info.emails if e not in l.raw_emails]
         l.raw_phones += [p for p in info.phones[:3] if p not in l.raw_phones]
-        add_socials(l, info.socials)
+        for k, v in info.socials.items():
+            l.socials.setdefault(k, v)
         if info.fetched:
             l.site_state = "ok"
         gained += bool(l.raw_emails) and not had
