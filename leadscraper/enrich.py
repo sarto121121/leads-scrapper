@@ -14,6 +14,7 @@ import requests
 import urllib3
 from bs4 import BeautifulSoup
 
+from .socials import NETWORKS, extract_candidates
 from .validate import clean_email, same_site
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -23,9 +24,6 @@ HEADERS = {"User-Agent": UA, "Accept": "text/html,application/xhtml+xml,applicat
 CONTACT_HINTS = ("contact", "contatt", "kontakt", "contacto", "contato", "impressum", "dove-siamo",
                  "dove siamo", "chi-siamo", "chi siamo", "quienes-somos", "nous-joindre", "contactez",
                  "get-in-touch", "reach", "iletisim", "fale-conosco", "about", "info", "support", "connect")
-SOCIALS = {"facebook.com": "facebook", "instagram.com": "instagram", "linkedin.com": "linkedin",
-           "twitter.com": "twitter", "x.com": "twitter", "youtube.com": "youtube",
-           "tiktok.com": "tiktok", "wa.me": "whatsapp", "api.whatsapp.com": "whatsapp"}
 EMAIL_FIND = re.compile(r"[A-Za-z0-9._%+\-]{1,64}@[A-Za-z0-9\-]+(?:\.[A-Za-z0-9\-]+)*\.[A-Za-z]{2,24}")
 OBFUSCATED = re.compile(r"\s*[\[\(\{]\s*(?:at|@|chiocciola|arroba|ät)\s*[\]\)\}]\s*", re.I)
 OBFUSCATED_DOT = re.compile(r"\s*[\[\(\{]\s*(?:dot|punto|ponto|point)\s*[\]\)\}]\s*", re.I)
@@ -53,7 +51,7 @@ class SiteInfo:
     def __init__(self) -> None:
         self.emails: list[str] = []
         self.phones: list[str] = []
-        self.socials: dict[str, str] = {}
+        self.socials: dict[str, list[str]] = {n: [] for n in NETWORKS}   # candidate profile links
         self.error: str = ""
         self.reachable: bool = False   # something answered (even an HTTP error such as 403)
         self.fetched: bool = False     # we actually got the home page HTML
@@ -195,17 +193,6 @@ def extract_phones(html: str, region: str | None) -> list[str]:
     return list(dict.fromkeys(found))
 
 
-def extract_socials(html: str) -> dict[str, str]:
-    out: dict[str, str] = {}
-    for a in BeautifulSoup(html, "lxml").select("a[href]"):
-        host = (urlparse(a["href"]).hostname or "").removeprefix("www.")
-        net = SOCIALS.get(host)
-        path = urlparse(a["href"]).path.strip("/")
-        if net and net not in out and path and not path.startswith(("sharer", "share", "intent")):
-            out[net] = a["href"]
-    return out
-
-
 def _contact_links(html: str, base: str, limit: int) -> list[str]:
     host = (urlparse(base).hostname or "").removeprefix("www.")
     scored: list[tuple[int, str]] = []
@@ -291,8 +278,8 @@ def _absorb(info: SiteInfo, html: str, urls: list[str], region: str | None) -> N
     for p in extract_phones(html, region):
         if p not in info.phones:
             info.phones.append(p)
-    for k, v in extract_socials(html).items():
-        info.socials.setdefault(k, v)
+    for net, urls in extract_candidates(html).items():
+        info.socials[net] += [u for u in urls if u not in info.socials[net]]
 
 
 def _first_page(url: str, session: requests.Session, robots: Robots | None, timeout: float,

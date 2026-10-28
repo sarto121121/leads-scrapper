@@ -10,11 +10,13 @@ from openpyxl.utils import get_column_letter
 
 from .models import Lead
 
-COLUMNS = [("Name", 38), ("Phone", 22), ("Email", 38), ("Address", 60), ("Website Present", 18), ("Website", 40)]
+COLUMNS = [("Name", 38), ("Phone", 22), ("Email", 38), ("Address", 60), ("Website Present", 18), ("Website", 40),
+           ("Instagram", 38), ("LinkedIn", 44)]
 
 
 def _row(l: Lead) -> list:
-    return [l.name, l.phone_display, l.email or l.email_note, l.address, l.website_status or ('Yes' if l.website else 'No'), l.website]
+    return [l.name, l.phone_display, l.email or l.email_note, l.address, l.website_status or ('Yes' if l.website else 'No'), l.website,
+            l.socials.get("instagram", ""), l.socials.get("linkedin", "")]
 
 
 def safe_filename(*parts: str) -> str:
@@ -41,10 +43,11 @@ def write_xlsx(leads: list[Lead], path: str, meta: dict[str, str]) -> None:
             c.font = Font(color="0563C1", underline="single")
         elif c.value:   # a reason such as "Not found on website"
             c.font = Font(color="808080", italic=True)
-        w = ws.cell(r, 6)
-        if w.value and str(w.value).startswith("http"):
-            w.hyperlink = str(w.value)
-            w.font = Font(color="0563C1", underline="single")
+        for col in (6, 7, 8):          # Website, Instagram, LinkedIn
+            w = ws.cell(r, col)
+            if w.value and str(w.value).startswith("http"):
+                w.hyperlink = str(w.value)
+                w.font = Font(color="0563C1", underline="single")
     ws.freeze_panes = "B2"
     ws.auto_filter.ref = ws.dimensions
 
@@ -59,6 +62,8 @@ def write_xlsx(leads: list[Lead], path: str, meta: dict[str, str]) -> None:
         ("No website", sum(not l.website for l in leads)),
         ("Email not found on website", sum(l.email_note == "Not found on website" for l in leads)),
         ("No website (so no email)", sum(l.email_note.startswith("No website") for l in leads)),
+        ("With Instagram", sum(bool(l.socials.get("instagram")) for l in leads)),
+        ("With LinkedIn", sum(bool(l.socials.get("linkedin")) for l in leads)),
         ("With email AND phone", sum(bool(l.email and l.phone) for l in leads)),
         ("Note", "Emails are only listed when found on the business's own listing/website and the "
                  "domain accepts mail. Phones are only listed when they are valid for their country."),

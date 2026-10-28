@@ -8,6 +8,7 @@ import requests
 
 from .categories import resolve
 from .models import Lead
+from .socials import normalize
 
 NOMINATIM = "https://nominatim.openstreetmap.org/search"
 OVERPASS_MIRRORS = [
@@ -108,9 +109,12 @@ def parse_elements(elements: list[dict], category: str, city: str, country: str)
         for k in ("email", "contact:email"):
             if t.get(k):
                 lead.raw_emails += [e for e in t[k].replace(",", ";").split(";") if e.strip()]
-        for k, net in (("contact:facebook", "facebook"), ("contact:instagram", "instagram")):
+        for k in ("contact:instagram", "contact:linkedin", "instagram", "linkedin"):
             if t.get(k):
-                lead.socials[net] = t[k]
+                n = normalize(t[k] if "/" in t[k] else
+                              ("instagram.com/" if "instagram" in k else "linkedin.com/company/") + t[k])
+                if n:
+                    lead.socials.setdefault(n[0], n[1])
         leads.append(lead)
     return leads
 
