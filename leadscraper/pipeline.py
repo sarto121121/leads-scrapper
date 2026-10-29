@@ -62,7 +62,7 @@ def _close(a: Lead | None, b: Lead) -> bool:
     return abs(a.lat - b.lat) < 0.003 and abs(a.lon - b.lon) < 0.003
 
 
-def enrich_all(leads: list[Lead], region: str | None, workers: int = 24, timeout: float = 8.0,
+def enrich_all(leads: list[Lead], region: str | None, workers: int = 32, timeout: float = 6.0,
                check_dns: bool = True, log=print, render: bool = True) -> None:
     session = make_session()
     robots = Robots(session, timeout)
@@ -105,7 +105,7 @@ def enrich_all(leads: list[Lead], region: str | None, workers: int = 24, timeout
             ex.shutdown(wait=False, cancel_futures=True)
     if render:
         # sites with no email yet (JavaScript-built pages, bot filters): read them like a visitor would
-        render_missing([l for l in todo if not l.raw_emails], region, log=log)
+        render_missing([l for l in todo if not l.raw_emails and l.site_state != "down"], region, log=log)
     finalize(leads, region, check_dns)
 
 

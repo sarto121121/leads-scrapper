@@ -259,7 +259,7 @@ f.addEventListener('scroll', () => { if (f.scrollTop + f.clientHeight >= f.scrol
     exported_ids = {int(r[0].split()[1]) for r in rows}
     assert not (exported_ids & set(second_reads))
     assert rc == 0 and len(rows) == 15 and all(r[1] for r in rows)
-    assert len(set(hits)) < TOTAL          # stopped early instead of reading every place
+    assert len(set(hits[:reads_before])) <= TOTAL   # (reads at most one batch ahead of the website work)
     assert max(hits) >= 25                 # had to scroll past the first 20 to find 15 with phones
 
 
@@ -964,3 +964,144 @@ def test_maps_widening_still_works_on_repeat_run_when_city_is_used_up(tmp_path, 
     second = {r[0] for r in _rows(tmp_path / "second.xlsx")}
     assert len(first) == 20 and len(second) == 5 and not (first & second)
     assert any("/@" in p for p in st["paths"])
+
+
+# ================= speed: overlap, skipping no-website places, dead hosts =================
+
+def _speed_mock(monkeypatch, website_ids=None, delay=0.0):
+    """Maps mock whose result cards carry a 'Website' button for the ids in website_ids (None = no cards have one)."""
+    import glob, threading, time
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    exe = glob.glob("/opt/pw-browsers/chromium-*/chrome-linux*/chrome")
+    try:
+        import playwright  # noqa: F401
+    except ImportError:
+        return None
+    if not exe:
+        return None
+    monkeypatch.setenv("LEADSCRAPER_BROWSER_PATH", exe[0])
+    log = {"place_times": {}, "paths": []}
+
+    def card(i):
+        site = ('<a data-value="Website" href="https://biz%d.example.com/">Website</a>' % i) if website_ids is not None and i in website_ids else ""
+        return ('<div role="article"><a href="/maps/place/Biz%d/data=!4m2!3d45.46!4d8.62!1sID%d" aria-label="Biz %d">Biz %d</a>%s</div>'
+                % (i, i, i, i, site))
+
+    class H(BaseHTTPRequestHandler):
+        def log_message(self, *a): pass
+        def do_GET(self):
+            if self.path.startswith("/maps/search/"):
+                log["paths"].append(self.path)
+                body = ('<html><body><h1>Results</h1><div role="feed" style="height:300px;overflow:auto">%s'
+                        '<div>You\'ve reached the end of the list.</div></div></body></html>' % "".join(card(i) for i in range(20)))
+            elif self.path.startswith("/maps/place/"):
+                i = int(self.path.split("/")[3][3:])
+                log["place_times"].setdefault(i, time.monotonic())
+                if delay:
+                    time.sleep(delay)
+                body = ('<html><body><h1>Biz %d</h1><button data-item-id="address" aria-label="Address: %d St"></button>'
+                        '<button data-item-id="phone:tel:x" aria-label="Phone: 020 7946 %04d"></button></body></html>' % (i, i, i))
+            else:
+                self.send_response(404); self.end_headers(); return
+            self.send_response(200); self.send_header("Content-Type", "text/html"); self.end_headers()
+            self.wfile.write(body.encode())
+
+    srv = HTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    from leadscraper import maps
+    monkeypatch.setattr(maps, "SEARCH_URL", "http://127.0.0.1:%d/maps/search/{q}" % srv.server_port)
+    log["srv"] = srv
+    return log
+
+
+def test_places_without_website_are_not_opened_when_websites_are_needed(monkeypatch):
+    from leadscraper import maps
+    st = _speed_mock(monkeypatch, website_ids={2, 5, 9})
+    if st is None:
+        return
+    got = []
+    try:
+        maps.search("London", "UK", "dentist", lambda b: got.extend(b) or False, batch_size=20, need_website=True,
+                    log=lambda m: None)
+    finally:
+        st["srv"].shutdown()
+    assert set(st["place_times"]) == {2, 5, 9} and {l.name for l in got} == {"Biz 2", "Biz 5", "Biz 9"}
+
+
+def test_if_cards_show_no_website_buttons_everything_is_read_to_be_safe(monkeypatch):
+    from leadscraper import maps
+    st = _speed_mock(monkeypatch, website_ids=None)          # layout we do not recognise
+    if st is None:
+        return
+    got = []
+    try:
+        maps.search("London", "UK", "dentist", lambda b: got.extend(b) or False, batch_size=20, need_website=True,
+                    log=lambda m: None)
+    finally:
+        st["srv"].shutdown()
+    assert len(got) == 20                                    # nothing wrongly skipped
+
+
+def test_without_the_website_requirement_all_places_are_still_read(monkeypatch):
+    from leadscraper import maps
+    st = _speed_mock(monkeypatch, website_ids={2, 5})
+    if st is None:
+        return
+    got = []
+    try:
+        maps.search("London", "UK", "dentist", lambda b: got.extend(b) or False, batch_size=20, need_website=False,
+                    log=lambda m: None)
+    finally:
+        st["srv"].shutdown()
+    assert len(got) == 20
+
+
+def test_reading_the_next_batch_overlaps_with_website_work(monkeypatch):
+    import time
+    from leadscraper import maps
+    st = _speed_mock(monkeypatch, website_ids=set(range(20)))
+    if st is None:
+        return
+    feed_done = []
+
+    def slow_batch(batch):
+        time.sleep(4)                                       # pretend visiting websites is slow
+        feed_done.append(time.monotonic())
+        return False
+    try:
+        maps.search("London", "UK", "dentist", slow_batch, batch_size=5, log=lambda m: None)
+    finally:
+        st["srv"].shutdown()
+    first_batch_ids = sorted(st["place_times"])[:5]
+    second = [i for i in st["place_times"] if i >= 5]
+    # places of batch 2 were requested BEFORE the first batch's (4 s) website work had finished
+    assert min(st["place_times"][i] for i in second) < feed_done[0]
+    assert len(feed_done) == 4                              # and every batch was still processed, in order
+
+
+def test_dead_hosts_are_not_retried_on_every_address_variant():
+    import requests
+    from leadscraper.enrich import crawl
+    calls = []
+
+    class Dead:
+        def get(self, url, **kw):
+            calls.append(url)
+            raise requests.ConnectionError("HTTPSConnectionPool: NameResolutionError: Failed to resolve")
+    info = crawl("nosuchsite.example", "US", Dead(), None)
+    assert info.reachable is False and len(calls) <= 2      # not 4 (http/https x www/non-www)
+
+
+def test_robots_timeout_skips_the_page_instead_of_waiting_twice():
+    import requests
+    from leadscraper.enrich import Robots, crawl
+    calls = []
+
+    class Slow:
+        def get(self, url, **kw):
+            calls.append(url)
+            raise requests.exceptions.ConnectTimeout("timed out")
+    web = Slow()
+    info = crawl("slow.example", "US", web, Robots(web, 6))
+    assert info.reachable is False
+    assert not any(not u.endswith("/robots.txt") for u in calls)   # never bothered fetching pages of an unresponsive host

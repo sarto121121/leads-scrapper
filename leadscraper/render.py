@@ -13,9 +13,9 @@ from .browser import launch_kwargs
 from .enrich import GUESS_PATHS, SiteInfo, UA, _absorb, _candidates, _contact_links, normalize_url
 from .models import Lead
 
-PAGE_TIMEOUT_MS = 25000
-SITE_BUDGET_S = 90
-MAX_PAGES = 5
+PAGE_TIMEOUT_MS = 15000
+SITE_BUDGET_S = 40
+MAX_PAGES = 3
 
 
 async def _render_one(ctx, url: str, region: str | None, info: SiteInfo) -> SiteInfo:
@@ -33,7 +33,7 @@ async def _render_one(ctx, url: str, region: str | None, info: SiteInfo) -> Site
                 info.reachable, info.status = True, resp.status
             if resp is not None and resp.status < 400:
                 try:
-                    await page.wait_for_load_state("networkidle", timeout=6000)  # let scripts build the page
+                    await page.wait_for_load_state("networkidle", timeout=2500)  # let scripts build the page
                 except Exception:
                     pass
                 html, final = await page.content(), page.url
@@ -57,7 +57,7 @@ async def _render_one(ctx, url: str, region: str | None, info: SiteInfo) -> Site
                 if resp is None or resp.status >= 400:
                     continue
                 try:
-                    await page.wait_for_load_state("networkidle", timeout=5000)
+                    await page.wait_for_load_state("networkidle", timeout=2000)
                 except Exception:
                     pass
                 _absorb(info, await page.content(), urls, region)
@@ -104,7 +104,7 @@ async def _run(urls: list[str], region: str | None, concurrency: int) -> list[Si
             await browser.close()
 
 
-def render_missing(leads: list[Lead], region: str | None, concurrency: int = 4, log=print) -> int:
+def render_missing(leads: list[Lead], region: str | None, concurrency: int = 8, log=print) -> int:
     """Re-read the websites of `leads` in a browser; returns how many gained an email."""
     targets = [(l, normalize_url(l.website)) for l in leads]
     targets = [(l, u) for l, u in targets if u]

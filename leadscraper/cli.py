@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import time
 from datetime import datetime
 
 from pathlib import Path
@@ -57,9 +58,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--no-dns-check", action="store_true", help="Skip email domain verification")
     p.add_argument("--require-email", action="store_true", help="Keep only leads that have a verified email")
     p.add_argument("--require-phone", action="store_true", help="Keep only leads that have a valid phone")
-    p.add_argument("--workers", type=int, default=24, help="Parallel website fetches (default 24)")
-    p.add_argument("--timeout", type=float, default=8.0, help="Per-request timeout seconds for websites")
+    p.add_argument("--workers", type=int, default=32, help="Parallel website fetches (default 32)")
+    p.add_argument("--timeout", type=float, default=6.0, help="Per-request timeout seconds for websites (default 6)")
+    p.add_argument("--maps-workers", type=int, default=6,
+                   help="Google Maps places read in parallel (default 6; higher is faster but risks a captcha)")
+    p.add_argument("--fast", action="store_true",
+                   help="Speed over completeness: no browser fallback, 48 website workers, 8 Maps workers, "
+                        "5 s timeouts (finds somewhat fewer emails)")
     a = p.parse_args(argv)
+    if a.fast:
+        a.no_render, a.workers, a.maps_workers, a.timeout = True, 48, 8, 5.0
     for attr, prompt in (("country", "Country"), ("city", "City"), ("category", "Business type(s)")):
         if not getattr(a, attr):
             if not sys.stdin.isatty():
@@ -79,6 +87,7 @@ class Collector:
         self.leads: list[Lead] = []
         self.seen: set[str] = set()
         self.skipped = 0
+        self.web_seconds = 0.0      # time spent on websites (crawl + browser fallback)
 
     def _known(self, l: Lead) -> bool:
         return self.run.seen(l) or (not self.a.include_seen and self.hist.seen(l, self.a.require_email))
@@ -115,6 +124,7 @@ class Collector:
                 continue
             fresh.append(l)
         if fresh:
+            t0 = time.monotonic()
             try:
                 if self.a.no_website_crawl:
                     finalize(fresh, self.region, not self.a.no_dns_check)
@@ -124,6 +134,9 @@ class Collector:
             except Exception as e:      # never lose a batch because one website misbehaved
                 _log(f"  warning: website step failed ({type(e).__name__}: {str(e)[:100]}); using Maps data only")
                 finalize(fresh, self.region, not self.a.no_dns_check)
+            took = time.monotonic() - t0
+            self.web_seconds += took
+            _log(f"  websites of {len(fresh)} places checked in {took:.0f}s")
             for l in fresh:
                 if self.done:           # only the wanted number is kept (and remembered)
                     break
@@ -165,6 +178,8 @@ def main(argv: list[str] | None = None) -> int:
     if hist.exported and not a.include_seen:
         _log(f"History: {hist.exported} leads exported before will be skipped (use --include-seen to keep them).")
 
+    t_start = time.monotonic()
+    web_seconds = 0.0
     result: list[Lead] = []
     skipped_total = 0
     stopped = ""            # why collection ended early (captcha, error, Ctrl+C), if it did
@@ -174,7 +189,8 @@ def main(argv: list[str] | None = None) -> int:
         col = Collector(a, region, hist, run)
         if use_maps:
             err = _guarded(maps.search, a.city, a.country, cat, col.feed, areas, more_queries=bool(a.count),
-                           headless=not a.show_browser, log=_log,
+                           headless=not a.show_browser, log=_log, concurrency=a.maps_workers,
+                           need_website=a.require_email or a.complete or a.website == "yes",
                            skip_ids=frozenset() if a.include_seen else frozenset(hist.skip_ids(a.require_email)),
                            radius_km=a.radius if a.count else 0)
             if err:
@@ -207,6 +223,7 @@ def main(argv: list[str] | None = None) -> int:
         if col.skipped:
             _log(f"  skipped {col.skipped} leads already exported before or duplicated in this run")
         skipped_total += col.skipped
+        web_seconds += col.web_seconds
         run.add(leads)
         result += leads
         if stopped:
@@ -244,6 +261,9 @@ def main(argv: list[str] | None = None) -> int:
          f"({sum(bool(l.email) for l in result)} with email, {sum(bool(l.phone) for l in result)} with phone, "
          f"{sum(bool(l.website) for l in result)} with website)\nSaved to {Path(out).resolve()}\n"
          f"History: {hist.exported} leads remembered in {hist_path} (next run returns only new ones)")
+    elapsed = time.monotonic() - t_start
+    _log(f"Time: {elapsed / 60:.1f} min in total, of which {web_seconds / 60:.1f} min went on visiting websites "
+         f"(runs in parallel with Google Maps reading). Add --fast for a quicker, slightly less complete run.")
     no_site = sum(not l.website for l in result)
     if not a.require_email and no_site and sum(bool(l.email) for l in result) < 0.7 * len(result):
         _log(f"Tip: {no_site} of these {len(result)} leads have no website, so there is no page to read an "
