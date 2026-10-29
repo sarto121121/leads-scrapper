@@ -30,12 +30,7 @@ EMAIL_FIND = re.compile(r"[A-Za-z0-9._%+\-]{1,64}@[A-Za-z0-9\-]+(?:\.[A-Za-z0-9\
 OBFUSCATED = re.compile(r"\s*[\[\(\{]\s*(?:at|@|chiocciola|arroba|ät)\s*[\]\)\}]\s*", re.I)
 OBFUSCATED_DOT = re.compile(r"\s*[\[\(\{]\s*(?:dot|punto|ponto|point)\s*[\]\)\}]\s*", re.I)
 MAX_BYTES = 1_500_000
-_NO_DNS = ("NameResolutionError", "getaddrinfo", "Name or service not known", "nodename nor servname")
-
-
-def _dns_failure(text: str) -> bool:
-    return any(marker in text for marker in _NO_DNS)
-CRAWL_BUDGET_S = 30.0     # max time spent on one website's extra pages
+CRAWL_BUDGET_S = 45.0     # max time spent on one website's extra pages
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 SKIP_HOSTS = {"facebook.com", "instagram.com", "linkedin.com", "twitter.com", "x.com", "tiktok.com",
               "youtube.com", "wa.me", "linktr.ee", "business.site", "g.page", "goo.gl", "maps.google.com"}
@@ -72,7 +67,6 @@ class Robots:
     def __init__(self, session: requests.Session, timeout: float):
         self.s, self.t = session, timeout
         self._parsers: dict[str, RobotFileParser | None] = {}
-        self._errors: dict[str, Exception] = {}      # hosts whose robots.txt could not even be reached
         self._lock = threading.Lock()
 
     def allowed(self, url: str) -> bool:
@@ -82,34 +76,17 @@ class Robots:
             known = host in self._parsers
         if not known:
             rp: RobotFileParser | None = None
-            err: Exception | None = None
             try:
-                r = self.s.get(host + "/robots.txt", timeout=min(self.t, 4.0))
+                r = self.s.get(host + "/robots.txt", timeout=self.t)
                 if r.ok:
                     rp = RobotFileParser()
                     rp.parse(r.text.splitlines())
-            except requests.RequestException as e:
-                rp, err = None, e
+            except requests.RequestException:
+                rp = None
             with self._lock:
                 self._parsers[host] = rp
-                if err is not None:
-                    self._errors[host] = err
         rp = self._parsers[host]
         return True if rp is None else rp.can_fetch(UA, url)
-
-
-    def error_text(self, url: str) -> str:
-        p = urlparse(url)
-        return str(self._errors.get(f"{p.scheme}://{p.netloc}", ""))
-
-    def unreachable(self, url: str) -> bool:
-        """True when robots.txt could not be fetched because the host does not answer at all.
-
-        (A certificate error does not count: the page itself is still fetched with a fallback.)
-        """
-        p = urlparse(url)
-        err = self._errors.get(f"{p.scheme}://{p.netloc}")
-        return err is not None and not isinstance(err, requests.exceptions.SSLError)
 
 
 def normalize_url(url: str) -> str:
@@ -320,25 +297,14 @@ def _absorb(info: SiteInfo, html: str, urls: list[str], region: str | None) -> N
 
 def _first_page(url: str, session: requests.Session, robots: Robots | None, timeout: float,
                 info: SiteInfo) -> tuple[str, str] | None:
-    dead: set[str] = set()                    # hosts that failed to resolve: their other schemes will too
     for cand in _candidates(url):
-        host = urlparse(cand).hostname or ""
-        if host in dead:
-            continue
         if robots and not robots.allowed(cand):
             info.robots_blocked = info.reachable = True   # we respect robots.txt; browser fallback may still read it
             return None
-        if robots and robots.unreachable(cand):          # robots.txt just timed out/refused: the page will too
-            info.error = "unreachable"
-            if _dns_failure(robots.error_text(cand)):
-                dead.add(host)
-            continue
         try:
             html, final, status = _get(session, cand, timeout)
         except requests.RequestException as e:
             info.error = type(e).__name__
-            if _dns_failure(str(e)):
-                dead.add(host)
             continue
         info.reachable, info.status = True, status
         if html:
@@ -349,7 +315,7 @@ def _first_page(url: str, session: requests.Session, robots: Robots | None, time
 
 
 def crawl(website: str, region: str | None, session: requests.Session, robots: Robots | None = None,
-          timeout: float = 6.0, max_pages: int = 6) -> SiteInfo:
+          timeout: float = 8.0, max_pages: int = 8) -> SiteInfo:
     info = SiteInfo()
     url = normalize_url(website)
     if not url:

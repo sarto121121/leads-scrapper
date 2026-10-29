@@ -51,13 +51,6 @@ A lead counts as already seen if its Google listing, phone, email, or name+websi
 (e.g. one per client). Leads are recorded only after the Excel file is saved successfully.
 When every match has been exported already, use `--areas` or another city/type.
 
-### Speed
-Reading Google Maps and visiting websites run side by side (the next places are read while the previous
-ones' websites are checked). With `--require-email` / `--website yes`, places whose result card shows no
-"Website" button are not opened at all (they cannot give an email). `--fast` trades some emails for speed
-(no browser fallback, more parallel workers); `--maps-workers N`, `--workers N`, `--timeout S` tune it
-individually. The run prints how long websites took, so you can see where time goes.
-
 ### Getting emails (cold emailing)
 Emails come from the business's own website (Google Maps does not publish them), so a business with
 no website cannot have one found. Roughly half of small local businesses have no website. For a list
