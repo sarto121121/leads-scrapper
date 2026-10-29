@@ -14,6 +14,7 @@ import statistics
 from urllib.parse import quote
 
 from .browser import launch_kwargs
+from .enrich import is_social
 from .models import Lead
 
 SEARCH_URL = "https://www.google.com/maps/search/{q}?hl=en"
@@ -159,7 +160,8 @@ def ring_points(lat: float, lon: float, radius_km: float, step_km: float = 5.0) 
 
 async def _run(queries: list[str], category: str, city: str, country: str, on_batch,
                batch_size: int, headless: bool, concurrency: int, log,
-               skip_ids: frozenset[str] = frozenset(), radius_km: float = 0, need_website: bool = False) -> None:
+               skip_ids: frozenset[str] = frozenset(), radius_km: float = 0, need_website: bool = False,
+               need_no_website: bool = False) -> None:
     try:
         from playwright.async_api import async_playwright
     except ImportError as e:
@@ -223,13 +225,18 @@ async def _run(queries: list[str], category: str, city: str, country: str, on_ba
                     fresh = [(u, n) for u, n in items.items() if u not in done_urls]
                     # places already read under an earlier search count as handled
                     done_urls.update(u for u, _ in fresh if _place_id(u) in seen_ids or _place_id(u) in skip_ids)
-                    if need_website and any(sites.values()):
-                        # The cards show a Website button, and this search needs websites (emails come from
-                        # them): don't open places that have none. If NO card shows the button, the page
-                        # layout is not what we expect, so we read everything instead (slower, never wrong).
-                        nosite = [u for u, _ in fresh if u not in done_urls and not sites.get(u)]
-                        skipped_nosite += len(nosite)
-                        done_urls.update(nosite)
+                    if (need_website or need_no_website) and any(sites.values()):
+                        # The result cards show a Website button only for places that have a website. Emails
+                        # come from websites, so a search that needs emails can ignore places without one; a
+                        # search for businesses WITHOUT a website (web-dev prospects) can ignore the others.
+                        # A Facebook/Instagram page does not count as a website. If NO card shows the button
+                        # the page layout is not what we expect, so we read everything (slower, never wrong).
+                        def real_site(u: str) -> bool:
+                            return bool(sites.get(u)) and not is_social(sites[u])
+                        skip = [u for u, _ in fresh if u not in done_urls
+                                and (not real_site(u) if need_website else real_site(u))]
+                        skipped_nosite += len(skip)
+                        done_urls.update(skip)
                     new = [(u, n) for u, n in fresh if u not in done_urls][:batch_size]
                     if not new:
                         if ended:
@@ -237,7 +244,8 @@ async def _run(queries: list[str], category: str, city: str, country: str, on_ba
                         continue
                     done_urls.update(u for u, _ in new)
                     log(f"  reading {len(new)} places ({len(done_urls)} listed so far"
-                        + (f", {skipped_nosite} skipped: no website" if skipped_nosite else "") + ") ...")
+                        + (f", {skipped_nosite} skipped: " + ("no website" if need_website else "has a website")
+                          if skipped_nosite else "") + ") ...")
                     sem = asyncio.Semaphore(concurrency)
                     details = await asyncio.gather(*[_detail(ctx, u, sem) for u, _ in new],
                                                    return_exceptions=True)
@@ -323,7 +331,7 @@ def _place_id(url: str) -> str:
 def search(city: str, country: str, category: str, on_batch, areas: list[str] | None = None,
            more_queries: bool = False, batch_size: int = 20, headless: bool = True,
            concurrency: int = 4, log=print, skip_ids: frozenset[str] = frozenset(),
-           radius_km: float = 0, need_website: bool = False) -> None:
+           radius_km: float = 0, need_website: bool = False, need_no_website: bool = False) -> None:
     """Stream results to on_batch(list[Lead]) -> bool. Stop as soon as it returns True.
 
     more_queries adds differently-worded searches when a target count is not met; radius_km > 0 then
@@ -334,4 +342,4 @@ def search(city: str, country: str, category: str, on_batch, areas: list[str] | 
     if more_queries:
         base += [f"best {category} in {city}, {country}", f"{category} near {city}, {country}"]
     asyncio.run(_run(base, category, city, country, on_batch, batch_size, headless, concurrency, log,
-                     skip_ids, radius_km, need_website))
+                     skip_ids, radius_km, need_website, need_no_website))

@@ -51,6 +51,15 @@ A lead counts as already seen if its Google listing, phone, email, or name+websi
 (e.g. one per client). Leads are recorded only after the Excel file is saved successfully.
 When every match has been exported already, use `--areas` or another city/type.
 
+### Goals (what are the leads for?)
+```bash
+--goal webdev   # businesses WITHOUT a real website (Facebook page = none) that have a phone + address
+--goal calling  # businesses with a phone + address; never visits websites, so it is the fastest
+--goal email    # leads with a verified email (cold email / app-dev outreach); reads websites
+```
+Example: `python -m leadscraper -c USA -t "Dallas, Texas" -k "dental clinic,restaurant" -n 250 --goal webdev`.
+Emails only exist on a business's website, so `webdev`/`calling` leads have a phone, not an email.
+
 ### Speed
 Reading Google Maps and visiting websites run side by side (the next places are read while the previous
 ones' websites are checked). With `--require-email` / `--website yes`, places whose result card shows no
