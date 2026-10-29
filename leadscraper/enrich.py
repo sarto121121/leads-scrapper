@@ -328,11 +328,11 @@ def _first_page(url: str, session: requests.Session, robots: Robots | None, time
         if robots and not robots.allowed(cand):
             info.robots_blocked = info.reachable = True   # we respect robots.txt; browser fallback may still read it
             return None
-        if robots and robots.unreachable(cand) and _dns_failure(robots.error_text(cand)):
-            info.error = "unreachable"          # the host name does not exist: nothing to fetch on any scheme
-            dead.add(host)
+        if robots and robots.unreachable(cand):          # robots.txt just timed out/refused: the page will too
+            info.error = "unreachable"
+            if _dns_failure(robots.error_text(cand)):
+                dead.add(host)
             continue
-        # (a robots.txt that merely timed out or was reset says nothing about the home page: still try it)
         try:
             html, final, status = _get(session, cand, timeout)
         except requests.RequestException as e:

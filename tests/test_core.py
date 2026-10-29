@@ -1092,133 +1092,16 @@ def test_dead_hosts_are_not_retried_on_every_address_variant():
     assert info.reachable is False and len(calls) <= 2      # not 4 (http/https x www/non-www)
 
 
-def test_slow_robots_txt_does_not_make_us_skip_the_website():
-    """Regression: a robots.txt that times out must NOT stop us reading a home page that has an email."""
-    import requests
-    from leadscraper.enrich import Robots, crawl
-
-    class Web:
-        def get(self, url, **kw):
-            if url.endswith("/robots.txt"):
-                raise requests.exceptions.ReadTimeout("robots slow")
-            sent = []
-            class Raw:
-                def read(self, n, decode_content=True):
-                    if sent: return b""
-                    sent.append(1); return b'<a href="mailto:info@clinic.com">mail</a>'
-            r = type("R", (), {})()
-            r.ok, r.status_code, r.url, r.encoding = True, 200, url, "utf-8"
-            r.headers, r.raw, r.close = {"content-type": "text/html"}, Raw(), (lambda: None)
-            return r
-    w = Web()
-    assert crawl("clinic.com", "US", w, Robots(w, 6)).emails == ["info@clinic.com"]
-
-
-def test_robots_dns_failure_skips_the_host_quickly():
+def test_robots_timeout_skips_the_page_instead_of_waiting_twice():
     import requests
     from leadscraper.enrich import Robots, crawl
     calls = []
 
-    class Dead:
+    class Slow:
         def get(self, url, **kw):
             calls.append(url)
-            raise requests.ConnectionError("NameResolutionError: Failed to resolve")
-    web = Dead()
-    crawl("nosuch.example", "US", web, Robots(web, 6))
-    assert not any(not u.endswith("/robots.txt") for u in calls)
-
-
-# ================= goals: webdev / calling / email =================
-
-def test_maps_skips_places_WITH_a_website_when_looking_for_web_dev_prospects(monkeypatch):
-    from leadscraper import maps
-    st = _speed_mock(monkeypatch, website_ids={2, 5, 9})
-    if st is None:
-        return
-    got = []
-    try:
-        maps.search("London", "UK", "dentist", lambda b: got.extend(b) or False, batch_size=20,
-                    need_no_website=True, log=lambda m: None)
-    finally:
-        st["srv"].shutdown()
-    assert set(st["place_times"]) == set(range(20)) - {2, 5, 9}       # places with a site were never opened
-
-
-def test_facebook_only_card_counts_as_no_website_for_the_web_dev_search(monkeypatch):
-    import glob, threading
-    from http.server import BaseHTTPRequestHandler, HTTPServer
-    from leadscraper import maps
-    st = _speed_mock(monkeypatch, website_ids={2})
-    if st is None:
-        return
-    # Re-serve card 5 with a Facebook "website": it has no real site of its own, so it must still be read
-    orig = maps.SEARCH_URL
-    st["srv"].shutdown()
-    hits = []
-
-    class H(BaseHTTPRequestHandler):
-        def log_message(self, *a): pass
-        def do_GET(self):
-            if self.path.startswith("/maps/search/"):
-                cards = "".join(
-                    '<div role="article"><a href="/maps/place/Biz%d/data=!4m2!3d45.4!4d8.6!1sID%d" aria-label="Biz %d">x</a>%s</div>'
-                    % (i, i, i, {2: '<a data-value="Website" href="https://real-site.com/">w</a>',
-                                 5: '<a data-value="Website" href="https://www.facebook.com/biz5">w</a>'}.get(i, ""))
-                    for i in range(8))
-                body = ('<html><body><div role="feed" style="height:200px;overflow:auto">%s<div>You\'ve reached the end of the list.</div></div></body></html>' % cards)
-            elif self.path.startswith("/maps/place/"):
-                i = int(self.path.split("/")[3][3:]); hits.append(i)
-                body = ('<html><body><h1>Biz %d</h1><button data-item-id="address" aria-label="Address: %d St"></button>'
-                        '<button data-item-id="phone:tel:x" aria-label="Phone: 020 7946 %04d"></button></body></html>' % (i, i, i))
-            else:
-                self.send_response(404); self.end_headers(); return
-            self.send_response(200); self.send_header("Content-Type", "text/html"); self.end_headers()
-            self.wfile.write(body.encode())
-    srv = HTTPServer(("127.0.0.1", 0), H)
-    threading.Thread(target=srv.serve_forever, daemon=True).start()
-    monkeypatch.setattr(maps, "SEARCH_URL", "http://127.0.0.1:%d/maps/search/{q}" % srv.server_port)
-    try:
-        maps.search("London", "UK", "x", lambda b: False, batch_size=20, need_no_website=True, log=lambda m: None)
-    finally:
-        srv.shutdown()
-    assert 2 not in hits and 5 in hits and set(hits) == set(range(8)) - {2}
-
-
-def _goal_run(tmp_path, monkeypatch, goal, *extra):
-    def fake(city, country, cat, log=print):
-        return [Lead("No Site Salon", cat, "1 High St", lat=1, lon=1, raw_phones=["+44 20 7946 0001"]),
-                Lead("Facebook Only", cat, "2 High St", lat=2, lon=2, website="https://facebook.com/fb",
-                     raw_phones=["+44 20 7946 0002"]),
-                Lead("Has Site", cat, "3 High St", lat=3, lon=3, website="https://has-site.co.uk",
-                     raw_phones=["+44 20 7946 0003"], raw_emails=["hi@has-site.co.uk"]),
-                Lead("No Phone", cat, "4 High St", lat=4, lon=4),
-                Lead("No Address", cat, "", lat=5, lon=5, raw_phones=["+44 20 7946 0005"])], \
-               osm.Place("x", "GB", country, "relation", 1, (0, 0, 1, 1))
-    return _run_cli(tmp_path, monkeypatch, fake, "--goal", goal, "--no-render", *extra)
-
-
-def test_goal_webdev_returns_only_businesses_without_a_real_website(tmp_path, monkeypatch):
-    rc, rows = _goal_run(tmp_path, monkeypatch, "webdev")
-    # no website (Facebook page counts as none) AND a phone AND an address; email is not needed
-    assert rc == 0 and sorted(r[0] for r in rows) == ["Facebook Only", "No Site Salon"]
-    assert all(r[4] == "No" and r[1] for r in rows)
-
-
-def test_goal_calling_wants_a_phone_and_ignores_the_website(tmp_path, monkeypatch):
-    rc, rows = _goal_run(tmp_path, monkeypatch, "calling")
-    assert sorted(r[0] for r in rows) == ["Facebook Only", "Has Site", "No Site Salon"]
-
-
-def test_goal_email_wants_a_verified_email(tmp_path, monkeypatch):
-    rc, rows = _goal_run(tmp_path, monkeypatch, "email")
-    assert [r[0] for r in rows] == ["Has Site"] and rows[0][2] == "hi@has-site.co.uk"
-
-
-def test_goal_presets_set_the_expected_flags():
-    from leadscraper import cli
-    a = cli.parse_args(["-c", "US", "-t", "Dallas", "-k", "x", "--goal", "webdev"])
-    assert (a.website, a.require_phone, a.require_address, a.no_website_crawl) == ("no", True, True, True)
-    a = cli.parse_args(["-c", "US", "-t", "Dallas", "-k", "x", "--goal", "calling"])
-    assert a.require_phone and a.no_website_crawl and a.website == "any" and not a.require_email
-    a = cli.parse_args(["-c", "US", "-t", "Dallas", "-k", "x", "--goal", "email"])
-    assert a.require_email and not a.no_website_crawl
+            raise requests.exceptions.ConnectTimeout("timed out")
+    web = Slow()
+    info = crawl("slow.example", "US", web, Robots(web, 6))
+    assert info.reachable is False
+    assert not any(not u.endswith("/robots.txt") for u in calls)   # never bothered fetching pages of an unresponsive host

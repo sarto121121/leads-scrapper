@@ -48,12 +48,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="Also return leads that earlier runs already exported (default: only NEW leads)")
     p.add_argument("--reset-history", action="store_true", help="Forget all previously exported leads")
     p.add_argument("--history", help=f"History file (default: {default_path()})")
-    p.add_argument("--goal", choices=["webdev", "calling", "email"],
-                   help="Preset for what the leads are for. webdev = businesses WITHOUT a website (web-design "
-                        "prospects) that have a phone and address; calling = businesses with a phone number "
-                        "(cold calling; fastest, no website visits); email = leads with a verified email (cold "
-                        "email / app-dev outreach)")
-    p.add_argument("--require-address", action="store_true", help="Only leads that have an address")
     p.add_argument("--complete", action="store_true",
                    help="Only leads that have ALL of: email, phone and address")
     p.add_argument("--keep-incomplete", action="store_true",
@@ -72,12 +66,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="Speed over completeness: no browser fallback, 48 website workers, 8 Maps workers, "
                         "5 s timeouts (finds somewhat fewer emails)")
     a = p.parse_args(argv)
-    if a.goal == "webdev":      # no website -> nothing to crawl, no email can exist; need a number to call
-        a.website, a.require_phone, a.require_address, a.no_website_crawl = "no", True, True, True
-    elif a.goal == "calling":   # only the phone matters: do not spend time on websites
-        a.require_phone, a.require_address, a.no_website_crawl = True, True, True
-    elif a.goal == "email":
-        a.require_email = True
     if a.fast:
         a.no_render, a.workers, a.maps_workers, a.timeout = True, 48, 8, 5.0
     for attr, prompt in (("country", "Country"), ("city", "City"), ("category", "Business type(s)")):
@@ -111,8 +99,6 @@ class Collector:
         if a.require_email and not l.email:
             return False
         if a.require_phone and not l.phone:
-            return False
-        if a.require_address and not l.address:
             return False
         if a.complete and not (l.email and l.phone and l.address):
             return False
@@ -205,7 +191,6 @@ def main(argv: list[str] | None = None) -> int:
             err = _guarded(maps.search, a.city, a.country, cat, col.feed, areas, more_queries=bool(a.count),
                            headless=not a.show_browser, log=_log, concurrency=a.maps_workers,
                            need_website=a.require_email or a.complete or a.website == "yes",
-                           need_no_website=a.website == "no" and not (a.require_email or a.complete),
                            skip_ids=frozenset() if a.include_seen else frozenset(hist.skip_ids(a.require_email)),
                            radius_km=a.radius if a.count else 0)
             if err:
